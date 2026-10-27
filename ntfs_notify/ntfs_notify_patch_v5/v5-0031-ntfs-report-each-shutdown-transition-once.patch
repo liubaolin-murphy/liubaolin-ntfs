@@ -1,0 +1,99 @@
+From 7087d50154b3f08528e17e773dd4e8ef409da2ec Mon Sep 17 00:00:00 2001
+From: Baolin Liu <liubaolin@kylinos.cn>
+Date: Wed, 14 Oct 2026 07:39:10 +0800
+Subject: [PATCH v5 31/31] ntfs: report each shutdown transition once
+
+The existing shutdown sites set NV_Shutdown without notifying filesystem
+error listeners. Add ntfs_report_shutdown() and use it for forced
+shutdown, device removal, EA restoration and named-stream rollback.
+
+Use test_and_set_bit(NV_Shutdown, &vol->flags) to set the flag atomically
+and call the generic shutdown reporter only when the bit was previously
+clear. Concurrent callers therefore initiate one report per transition.
+Keep the existing conditions that trigger shutdown.
+
+Signed-off-by: Baolin Liu <liubaolin@kylinos.cn>
+---
+ fs/ntfs/ea.c           |  2 +-
+ fs/ntfs/named_stream.c |  2 +-
+ fs/ntfs/super.c        | 12 +++++++++---
+ fs/ntfs/volume.h       |  1 +
+ 4 files changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/fs/ntfs/ea.c b/fs/ntfs/ea.c
+index 49186982c316..217215757af1 100644
+--- a/fs/ntfs/ea.c
++++ b/fs/ntfs/ea.c
+@@ -379,7 +379,7 @@ static int ntfs_set_ea(struct inode *inode, const char *name, size_t name_len,
+ 				ntfs_report_file_metadata_error(inode, ea_err);
+ 			if (info_err)
+ 				ntfs_report_file_metadata_error(inode, info_err);
+-			NVolSetShutdown(ni->vol);
++			ntfs_report_shutdown(ni->vol);
+ 			ntfs_error(inode->i_sb,
+ 				   "Failed to restore EAs of inode 0x%llx (%d, %d); shutting down.",
+ 				   ni->mft_no, ea_err, info_err);
+diff --git a/fs/ntfs/named_stream.c b/fs/ntfs/named_stream.c
+index 2e2383e381a6..07d406cca977 100644
+--- a/fs/ntfs/named_stream.c
++++ b/fs/ntfs/named_stream.c
+@@ -661,7 +661,7 @@ struct inode *ntfs_create_named_stream(const struct mnt_idmap *idmap,
+ 				} else {
+ 					ntfs_report_file_metadata_error(base_vi,
+ 									rollback_err);
+-					NVolSetShutdown(base_ni->vol);
++					ntfs_report_shutdown(base_ni->vol);
+ 					err = -EIO;
+ 				}
+ 			}
+diff --git a/fs/ntfs/super.c b/fs/ntfs/super.c
+index 7c10a1b24b14..462173686a37 100644
+--- a/fs/ntfs/super.c
++++ b/fs/ntfs/super.c
+@@ -455,6 +455,12 @@ void ntfs_report_file_metadata_error(struct inode *inode, int error)
+ 		fserror_report_file_metadata(inode, error, GFP_ATOMIC);
+ }
+ 
++void ntfs_report_shutdown(struct ntfs_volume *vol)
++{
++	if (!test_and_set_bit(NV_Shutdown, &vol->flags))
++		fserror_report_shutdown(vol->sb, GFP_ATOMIC);
++}
++
+ void ntfs_handle_error(struct super_block *sb)
+ {
+ 	struct ntfs_volume *vol = NTFS_SB(sb);
+@@ -471,7 +477,7 @@ void ntfs_handle_error(struct super_block *sb)
+ 		      sb->s_id);
+ 	} else if (vol->on_errors == ON_ERRORS_CONTINUE) {
+ 		if (errseq_check(&sb->s_wb_err, vol->wb_err) == -ENODEV) {
+-			NVolSetShutdown(vol);
++			ntfs_report_shutdown(vol);
+ 			vol->wb_err = sb->s_wb_err;
+ 		}
+ 	}
+@@ -2352,10 +2358,10 @@ int ntfs_force_shutdown(struct super_block *sb, u32 flags)
+ 		if (ret)
+ 			return ret;
+ 		bdev_thaw(sb->s_bdev);
+-		NVolSetShutdown(vol);
++		ntfs_report_shutdown(vol);
+ 		break;
+ 	case FS_SHUTDOWN_FLAGS_NOLOGFLUSH:
+-		NVolSetShutdown(vol);
++		ntfs_report_shutdown(vol);
+ 		break;
+ 	default:
+ 		return -EINVAL;
+diff --git a/fs/ntfs/volume.h b/fs/ntfs/volume.h
+index 27f58beb4b2d..95ca0019906e 100644
+--- a/fs/ntfs/volume.h
++++ b/fs/ntfs/volume.h
+@@ -264,6 +264,7 @@ DEFINE_NVOL_BIT_OPS(StreamsWindows)
+ 
+ void ntfs_report_metadata_error(struct ntfs_volume *vol, int error);
+ void ntfs_report_file_metadata_error(struct inode *inode, int error);
++void ntfs_report_shutdown(struct ntfs_volume *vol);
+ 
+ static inline void ntfs_inc_free_clusters(struct ntfs_volume *vol, s64 nr)
+ {

@@ -1,0 +1,48 @@
+From 3ad6e5b4d9e146fa950c914778ae4fcea5e92b92 Mon Sep 17 00:00:00 2001
+From: Xuewen Wang <wangxuewen@kylinos.cn>
+Date: Wed, 14 Oct 2026 07:39:10 +0800
+Subject: [PATCH v5 11/31] ntfs: handle source record removal failure during
+ attribute moves
+
+ntfs_attr_record_move_to() ignores failure to remove the source attribute
+after copying it. It can update the attribute-list reference and report
+success with both copies present.
+
+Check removal before changing the list entry. On failure, attempt to
+remove the destination copy, mark its record dirty and unmap it, leaving
+the list pointing to the source. Report destination cleanup failure
+separately.
+
+Shrinking a record to zero needs no extra space, so failure indicates
+inconsistent record accounting. Return and report EFSCORRUPTED even if
+cleanup also fails.
+
+Fixes: 495e90fa3348 ("ntfs: update attrib operations")
+Signed-off-by: Xuewen Wang <wangxuewen@kylinos.cn>
+---
+ fs/ntfs/attrib.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/fs/ntfs/attrib.c b/fs/ntfs/attrib.c
+index c59643fb766a..07fb1c77c7af 100644
+--- a/fs/ntfs/attrib.c
++++ b/fs/ntfs/attrib.c
+@@ -3576,7 +3576,17 @@ int ntfs_attr_record_move_to(struct ntfs_attr_search_ctx *ctx, struct ntfs_inode
+ 	nctx->attr->instance = nctx->mrec->next_attr_instance;
+ 	nctx->mrec->next_attr_instance =
+ 		cpu_to_le16((le16_to_cpu(nctx->mrec->next_attr_instance) + 1) & 0xffff);
+-	ntfs_attr_record_resize(ctx->mrec, a, 0);
++	err = ntfs_attr_record_resize(ctx->mrec, a, 0);
++	if (err) {
++		err = -EFSCORRUPTED;
++		ntfs_report_file_metadata_error(VFS_I(ni), -EFSCORRUPTED);
++		if (ntfs_attr_record_resize(ni_mrec, nctx->attr, 0))
++			ntfs_report_file_metadata_error(VFS_I(ni),
++							-EFSCORRUPTED);
++		mark_mft_record_dirty(ni);
++		unmap_mft_record(ni);
++		goto put_err_out;
++	}
+ 	mark_mft_record_dirty(ctx->ntfs_ino);
+ 	mark_mft_record_dirty(ni);
+ 

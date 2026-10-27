@@ -1,0 +1,147 @@
+From 7087d50154b3f08528e17e773dd4e8ef409da2ec Mon Sep 17 00:00:00 2001
+From: Baolin Liu <liubaolin@kylinos.cn>
+Date: Mon, 26 Oct 2026 17:55:14 +0800
+Subject: [PATCH v5 00/31] ntfs: report filesystem errors through fsnotify
+
+Report NTFS metadata corruption, failed recovery and shutdown through
+FAN_FS_ERROR. File events identify the affected base file; volume events
+cover errors without a safe file reference. Preserve the existing volume
+error bit and errors= policy. Before SB_ACTIVE, metadata reporting helpers
+record the volume error state without queuing an event.
+
+Use -EFSCORRUPTED (-EUCLEAN) for confirmed corruption in the updated error
+paths, both in reports and in failing NTFS operations. Preserve the errnos
+of genuine I/O, allocation and unsupported-format failures. Ordinary EOF
+and missing names or streams are not corruption. Partial-I/O and
+best-effort operations retain their existing return semantics; an
+independent recovery failure can report a different errno from the
+initiating operation. Generic file-handle decoding may still translate
+filesystem errors to ESTALE.
+
+Based on ntfs-next commit 5dffb7307023
+("ntfs: handle a failed size rollback in the write error path").
+
+Changes since v4:
+- Rebase all 31 patches onto the updated ntfs-next.
+- Adapt patch 23 to the upstream file-write size rollback fix. Preserve
+  its locking, resident-attribute handling and size restoration; add
+  filesystem error reports for failed initialized-size and data-size
+  restoration.
+- Retain the new minimum INDX entries_offset validation in patch 19.
+  Return and report EUCLEAN when it detects corruption.
+- Preserve the upstream logfile USA count widening and adapt to the
+  current iomap code and const mnt_idmap interfaces.
+- Recheck reporting paths on the rebased tree and rerun the validation
+  listed below, including targeted tests of the new INDX offset check.
+
+The v3 review feedback remains addressed:
+- Extend reporting to previously uncovered corruption and recovery
+  failures across system metadata, attributes, runlists, indexes, MFT
+  records, compressed streams, EA/ACLs, named streams and reparse data.
+  This includes ntfs_ib_read(), nonresident iomap and the current lookup
+  path, ntfs_lookup_inode_by_name().
+- Reuse ntfs_inode_base() for base-file attribution, with volume reports
+  when inode eviction prevents retaining a file reference.
+- Use test_and_set_bit(NV_Shutdown, &vol->flags) so concurrent shutdown
+  callers initiate only one report for the transition.
+
+The series remains split by metadata subsystem and recovery operation.
+The search-context API conversion stays together with all its callers.
+
+Series organization:
+- 1-4: writeback errno propagation, cluster-free counts, reporting
+  helpers and search-context initialization errors.
+- 5-7: boot/MFT bootstrap, required system files and logfile errors.
+- 8-10: runlists/cluster allocation, iomap and LZNT1/WOF streams.
+- 11-17: attribute moves, lookup, record/list updates, conversion,
+  resize/relocation and incomplete range updates.
+- 18: inode metadata and eviction cleanup.
+- 19-22: index validation, traversal, directory lookup and index updates.
+- 23-24: namespace/file recovery and export parent reconstruction.
+- 25-27: MFT record lifecycle, bitmap/data growth and writeback.
+- 28-30: EA/ACLs, named streams and reparse/ObjectID metadata.
+- 31: atomic shutdown reporting.
+
+Validation on the final v5 tree:
+- Built all NTFS objects and the bootable kernel with W=1.
+- Sparse C=2 checked all 31 NTFS translation units without diagnostics.
+- Passed 13 QEMU guest runs with NTFS built in, including normal file
+  and namespace operations, named streams, inode/index/runlist/EA
+  corruption, readdir, shutdown, filesystem ustat selftests and
+  fsync/remount/data verification.
+- Two of those runs specifically exercised INDX entries_offset below
+  the new minimum, through lookup and readdir. Both operations returned
+  EUCLEAN and generated EUCLEAN events after the listener was ready.
+- These runs used KCSAN and lockdep; KCSAN selftests passed, and no
+  KCSAN or lockdep diagnostics were printed.
+
+Thanks to Hyunchul and Namjae for reviewing the earlier versions.
+
+Baolin Liu (11):
+  ntfs: preserve cluster-free counts in attribute cleanup
+  ntfs: add filesystem metadata error reporting helpers
+  ntfs: report runlist and cluster allocation metadata errors
+  ntfs: report attribute lookup and validation errors
+  ntfs: report attribute list update and recovery failures
+  ntfs: report attribute conversion and mapping update failures
+  ntfs: report inode metadata and eviction cleanup errors
+  ntfs: report MFT record validation and lifecycle errors
+  ntfs: report MFT bitmap and data growth recovery failures
+  ntfs: report MFT writeback errors to fsnotify
+  ntfs: report each shutdown transition once
+
+Dandan Wu (11):
+  ntfs: report required system file and volume metadata errors
+  ntfs: report logfile metadata and emptying errors
+  ntfs: report iomap corruption and preserve buffered read errors
+  ntfs: report LZNT1 and WOF compressed stream errors
+  ntfs: report attribute resize and relocation recovery failures
+  ntfs: report incomplete attribute range updates
+  ntfs: report index validation and block I/O errors
+  ntfs: preserve index traversal errors and directory retries
+  ntfs: report directory lookup and metadata corruption
+  ntfs: report index update and recovery failures
+  ntfs: report namespace and file recovery errors
+
+Xuewen Wang (9):
+  ntfs: propagate mapping-pairs update errors from inode writeback
+  ntfs: preserve attribute search context initialization errors
+  ntfs: report boot geometry and MFT bootstrap errors
+  ntfs: handle source record removal failure during attribute moves
+  ntfs: report attribute record update and cleanup failures
+  ntfs: serialize and report export parent reconstruction errors
+  ntfs: report EA metadata and restoration errors
+  ntfs: report named stream metadata and recovery errors
+  ntfs: report reparse and object ID metadata errors
+
+ fs/ntfs/aops.c         |  24 +-
+ fs/ntfs/attrib.c       | 738 ++++++++++++++++++++++++++++++-----------
+ fs/ntfs/attrib.h       |   8 +-
+ fs/ntfs/attrlist.c     |  43 ++-
+ fs/ntfs/bitmap.c       |   2 +-
+ fs/ntfs/compress.c     |  30 +-
+ fs/ntfs/dir.c          | 108 ++++--
+ fs/ntfs/ea.c           |  84 +++--
+ fs/ntfs/file.c         |  27 +-
+ fs/ntfs/index.c        | 316 ++++++++++++------
+ fs/ntfs/inode.c        | 265 ++++++++++-----
+ fs/ntfs/inode.h        |  10 +-
+ fs/ntfs/iomap.c        |  53 ++-
+ fs/ntfs/lcnalloc.c     |  17 +-
+ fs/ntfs/logfile.c      |  51 +--
+ fs/ntfs/mft.c          | 326 +++++++++++-------
+ fs/ntfs/named_stream.c |  55 ++-
+ fs/ntfs/namei.c        | 140 ++++++--
+ fs/ntfs/object_id.c    |  40 ++-
+ fs/ntfs/reparse.c      |  98 ++++--
+ fs/ntfs/reparse.h      |   2 +-
+ fs/ntfs/runlist.c      |  16 +-
+ fs/ntfs/runlist.h      |   1 +
+ fs/ntfs/stream.h       |   2 +-
+ fs/ntfs/super.c        | 279 +++++++++++-----
+ fs/ntfs/volume.h       |   4 +
+ fs/ntfs/wof.c          |  41 ++-
+ 27 files changed, 1967 insertions(+), 813 deletions(-)
+
+
+base-commit: 5dffb7307023d909277cb5f5f3f18f32afa31e2f
