@@ -132,6 +132,9 @@ Validation:
 - The QEMU test runs used non-strict KCSAN and lockdep; all 3 KCSAN
   selftests passed, and no KCSAN or lockdep diagnostics were printed.
 
+The patches in this series are available at:
+https://github.com/liubaolin-murphy/liubaolin-ntfs/tree/main/ntfs_notify/ntfs_notify_patch_v5
+
 Thanks to Hyunchul and Namjae for reviewing the earlier versions.
 
 Baolin Liu (11):
