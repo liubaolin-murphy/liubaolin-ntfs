@@ -1,4 +1,4 @@
-From 861150bfdabaa308fdfcf1561e59842b6480bbc3 Mon Sep 17 00:00:00 2001
+From b8ba9a918d4a59abe32ad4a5620bcd0520ee91e0 Mon Sep 17 00:00:00 2001
 From: Dandan Wu <wudandan@kylinos.cn>
 Date: Wed, 14 Oct 2026 07:39:10 +0800
 Subject: [PATCH v5 23/31] ntfs: report namespace and file recovery errors
@@ -10,6 +10,8 @@ affected failing lookups; ordinary missing names remain valid results.
 Report independent cleanup failures during create, link, rename, file
 size restoration and preallocation trimming. Use directory attribution
 where appropriate and volume reports during failed creation.
+Only negative reparse-index cleanup results are errors; a positive
+returned data length means cleanup succeeded.
 
 Report missing required parents and attributes during file fsync while
 retaining its best-effort lookup handling. Preserve the writeback errno
@@ -18,19 +20,36 @@ with EIO.
 
 Signed-off-by: Dandan Wu <wudandan@kylinos.cn>
 ---
- fs/ntfs/file.c  | 23 +++++++++++--
+
+
+Reparse cleanup return-value validation:
+- Eighteen extracted-source cases cover successful cleanup
+  lengths and failures with controlled dependencies under ASan/UBSan.
+- Before this fix, six successful cleanups passed positive values
+  to the error reporter. All eighteen cases pass after the fix.
+- These tests check local control flow, not kernel event delivery.
+
+ fs/ntfs/file.c  | 26 +++++++++++++--
  fs/ntfs/namei.c | 86 ++++++++++++++++++++++++++++++++++++-------------
- 2 files changed, 84 insertions(+), 25 deletions(-)
+ 2 files changed, 87 insertions(+), 25 deletions(-)
 
 diff --git a/fs/ntfs/file.c b/fs/ntfs/file.c
-index 16fdb649d0c2..f1e9f0e36ba9 100644
+index 16fdb649d0c2..9af63a64ac6d 100644
 --- a/fs/ntfs/file.c
 +++ b/fs/ntfs/file.c
-@@ -117,14 +117,17 @@ static int ntfs_trim_prealloc(struct inode *vi)
+@@ -85,6 +85,7 @@ int ntfs_file_open(struct inode *vi, struct file *filp)
+  */
+ static int ntfs_trim_prealloc(struct inode *vi)
+ {
++	int report_err = 0;
+ 	struct ntfs_inode *ni = NTFS_I(vi);
+ 	struct ntfs_inode *mrec_ni = ntfs_base_inode(ni);
+ 	struct ntfs_volume *vol = ni->vol;
+@@ -117,14 +118,17 @@ static int ntfs_trim_prealloc(struct inode *vi)
  		if (err) {
  			kvfree(ni->runlist.rl);
  			ni->runlist.rl = NULL;
-+			ntfs_report_file_metadata_error(vi, err);
++			report_err = err;
  			ntfs_error(vol->sb, "Preallocated block rollback failed");
  		} else {
  			ni->allocated_size = ntfs_cluster_to_bytes(vol, vcn_tr);
@@ -38,14 +57,23 @@ index 16fdb649d0c2..f1e9f0e36ba9 100644
  					ni, 0, ni);
 -			if (err)
 +			if (err) {
-+				ntfs_report_file_metadata_error(vi, err);
++				report_err = err;
  				ntfs_error(vol->sb,
  					   "Failed to rollback mapping pairs for prealloc");
 +			}
  		}
  	}
  
-@@ -341,8 +344,13 @@ int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
+@@ -133,6 +137,8 @@ static int ntfs_trim_prealloc(struct inode *vi)
+ 	mutex_unlock(&mrec_ni->mrec_lock);
+ 	inode_unlock(vi);
+ 
++	if (report_err)
++		ntfs_report_file_metadata_error(vi, report_err);
+ 	return err;
+ }
+ 
+@@ -341,8 +347,13 @@ int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
  					le16_to_cpu(ctx->attr->data.resident.value_offset));
  
  			parent_vi = ntfs_iget(vi->i_sb, MREF_LE(fn->parent_directory));
@@ -60,7 +88,7 @@ index 16fdb649d0c2..f1e9f0e36ba9 100644
  			mutex_lock_nested(&NTFS_I(parent_vi)->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
  			ia_vi = ntfs_index_iget(parent_vi, I30, 4);
  			mutex_unlock(&NTFS_I(parent_vi)->mrec_lock);
-@@ -373,6 +381,11 @@ int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
+@@ -373,6 +384,11 @@ int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
  			attr_vi = ntfs_attr_iget(vi, ctx->attr->type,
  						 name, ctx->attr->name_length);
  			if (IS_ERR(attr_vi)) {
@@ -72,7 +100,7 @@ index 16fdb649d0c2..f1e9f0e36ba9 100644
  				kfree(attr);
  				continue;
  			}
-@@ -810,7 +823,7 @@ static ssize_t ntfs_dio_write_iter(struct kiocb *iocb, struct iov_iter *from)
+@@ -810,7 +826,7 @@ static ssize_t ntfs_dio_write_iter(struct kiocb *iocb, struct iov_iter *from)
  		ret2 = filemap_write_and_wait_range(iocb->ki_filp->f_mapping,
  				offset, end);
  		if (ret2) {
@@ -81,7 +109,7 @@ index 16fdb649d0c2..f1e9f0e36ba9 100644
  			goto out;
  		}
  		invalidate_mapping_pages(iocb->ki_filp->f_mapping,
-@@ -954,6 +967,8 @@ ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+@@ -954,6 +970,8 @@ ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
  					old_init_size);
  			mutex_unlock(&mrec_ni->mrec_lock);
  		}
@@ -90,7 +118,7 @@ index 16fdb649d0c2..f1e9f0e36ba9 100644
  		/*
  		 * The shrink clamps the initialized size to the data size,
  		 * which can sit above the old initialized one and expose
-@@ -968,6 +983,8 @@ ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+@@ -968,6 +986,8 @@ ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
  			data_err = __ntfs_attr_truncate_vfs(ni, old_data_size,
  					old_data_size);
  			mutex_unlock(&mrec_ni->mrec_lock);
@@ -100,7 +128,7 @@ index 16fdb649d0c2..f1e9f0e36ba9 100644
  			if (data_err)
  				i_size_write(vi, ni->data_size);
 diff --git a/fs/ntfs/namei.c b/fs/ntfs/namei.c
-index 998f642b9f22..16aec7a8dbcf 100644
+index 998f642b9f22..090eb33bf362 100644
 --- a/fs/ntfs/namei.c
 +++ b/fs/ntfs/namei.c
 @@ -236,14 +236,21 @@ static struct dentry *ntfs_lookup(struct inode *dir_ino, struct dentry *dent,
@@ -190,7 +218,7 @@ index 998f642b9f22..16aec7a8dbcf 100644
 +	if (rollback_reparse) {
 +		int rollback_err = ntfs_delete_reparse_index(ni);
 +
-+		if (rollback_err)
++		if (rollback_err < 0)
 +			ntfs_report_metadata_error(ni->vol, rollback_err);
 +	}
  	/*

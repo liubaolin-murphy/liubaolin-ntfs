@@ -1,4 +1,4 @@
-From 1123ec0e2eb2dea26c0a4252b3a876bb49383be4 Mon Sep 17 00:00:00 2001
+From 845f35add94353801dce52fb1d1f47a610db50ec Mon Sep 17 00:00:00 2001
 From: Xuewen Wang <wangxuewen@kylinos.cn>
 Date: Wed, 14 Oct 2026 07:39:10 +0800
 Subject: [PATCH v5 05/31] ntfs: report boot geometry and MFT bootstrap errors
@@ -7,19 +7,20 @@ Mount initialization detects invalid MFT locations, mirror mismatches
 and corrupt bootstrap metadata without consistently recording them.
 Report these failures and use EFSCORRUPTED for confirmed corruption.
 
-Preserve specific errors through boot-sector parsing and MFT loading.
-Keep allocation failures and unsupported geometry distinct, and retain
-the existing read-only fallback. Before SB_ACTIVE, reporting records
-the volume error state without sending events.
+Preserve specific errors through boot-sector parsing and MFT loading,
+including the inner ntfs_read_locked_inode() failure during bootstrap.
+Use shared cleanup and reporting exits. Keep allocation failures and
+unsupported geometry distinct, and retain the read-only fallback.
+Before SB_ACTIVE, record the volume error state without sending events.
 
 Signed-off-by: Xuewen Wang <wangxuewen@kylinos.cn>
 ---
- fs/ntfs/inode.c | 27 ++++++++++++++++++++----
- fs/ntfs/super.c | 55 +++++++++++++++++++++++++++++++++++--------------
- 2 files changed, 62 insertions(+), 20 deletions(-)
+ fs/ntfs/inode.c | 28 +++++++++++++-------
+ fs/ntfs/super.c | 69 +++++++++++++++++++++++++++++++++++--------------
+ 2 files changed, 69 insertions(+), 28 deletions(-)
 
 diff --git a/fs/ntfs/inode.c b/fs/ntfs/inode.c
-index 5b3d1453d5e1..6ed995b09a3f 100644
+index 5b3d1453d5e1..c0f91b02efa0 100644
 --- a/fs/ntfs/inode.c
 +++ b/fs/ntfs/inode.c
 @@ -1880,7 +1880,7 @@ static int load_attribute_list_mount(struct ntfs_volume *vol,
@@ -100,19 +101,20 @@ index 5b3d1453d5e1..6ed995b09a3f 100644
  				ntfs_error(sb, "$MFT is too big! Aborting.");
  				goto put_err_out;
  			}
-@@ -2285,6 +2294,11 @@ int ntfs_read_inode_mount(struct inode *vi)
+@@ -2285,11 +2294,7 @@ int ntfs_read_inode_mount(struct inode *vi)
  			err = ntfs_read_locked_inode(vi);
  			if (err) {
  				ntfs_error(sb, "ntfs_read_inode() of $MFT failed.\n");
-+				if (err == -ENOENT) {
-+					err = -EFSCORRUPTED;
-+					ntfs_report_metadata_error(vol,
-+								   -EFSCORRUPTED);
-+				}
- 				NVolClearMftBootstrap(vol);
- 				ntfs_attr_put_search_ctx(ctx);
- 				/* Revert to the safe super operations. */
-@@ -2356,9 +2370,14 @@ int ntfs_read_inode_mount(struct inode *vi)
+-				NVolClearMftBootstrap(vol);
+-				ntfs_attr_put_search_ctx(ctx);
+-				/* Revert to the safe super operations. */
+-				kfree(m);
+-				return -1;
++				goto put_err_out;
+ 			}
+ 			/*
+ 			 * Re-initialize some specifics about $MFT's inode as
+@@ -2356,9 +2361,14 @@ int ntfs_read_inode_mount(struct inode *vi)
  err_out:
  	/* Also reached from inside the $DATA loop. */
  	NVolClearMftBootstrap(vol);
@@ -129,7 +131,7 @@ index 5b3d1453d5e1..6ed995b09a3f 100644
  
  static void __ntfs_clear_inode(struct ntfs_inode *ni)
 diff --git a/fs/ntfs/super.c b/fs/ntfs/super.c
-index 9bf5a626abbc..afee1b262a12 100644
+index 9bf5a626abbc..eb0ebbc235a4 100644
 --- a/fs/ntfs/super.c
 +++ b/fs/ntfs/super.c
 @@ -869,10 +869,10 @@ static bool ntfs_validate_mft_io_geometry(struct ntfs_volume *vol,
@@ -191,7 +193,7 @@ index 9bf5a626abbc..afee1b262a12 100644
  	}
  	/*
  	 * Get the size of the volume in clusters and check for 64-bit-ness.
-@@ -993,23 +993,25 @@ static bool parse_ntfs_boot_sector(struct ntfs_volume *vol,
+@@ -993,7 +993,7 @@ static bool parse_ntfs_boot_sector(struct ntfs_volume *vol,
  	ll = le64_to_cpu(b->number_of_sectors) >> sectors_per_cluster_bits;
  	if (ll >= 1ULL << 32) {
  		ntfs_error(vol->sb, "Cannot handle 64-bit clusters.");
@@ -200,36 +202,38 @@ index 9bf5a626abbc..afee1b262a12 100644
  	}
  	vol->nr_clusters = ll;
  	ntfs_debug("vol->nr_clusters = 0x%llx", vol->nr_clusters);
- 	ll = le64_to_cpu(b->mft_lcn);
+@@ -1001,7 +1001,7 @@ static bool parse_ntfs_boot_sector(struct ntfs_volume *vol,
  	if (ll >= (u64)vol->nr_clusters) {
-+		ntfs_report_metadata_error(vol, -EFSCORRUPTED);
  		ntfs_error(vol->sb, "MFT LCN (%llu, 0x%llx) is beyond end of volume.  Weird.",
  				ll, ll);
 -		return false;
-+		return -EFSCORRUPTED;
++		goto corrupt;
  	}
  	vol->mft_lcn = ll;
  	ntfs_debug("vol->mft_lcn = 0x%llx", vol->mft_lcn);
- 	ll = le64_to_cpu(b->mftmirr_lcn);
+@@ -1009,7 +1009,7 @@ static bool parse_ntfs_boot_sector(struct ntfs_volume *vol,
  	if (ll >= (u64)vol->nr_clusters) {
-+		ntfs_report_metadata_error(vol, -EFSCORRUPTED);
  		ntfs_error(vol->sb, "MFTMirr LCN (%llu, 0x%llx) is beyond end of volume.  Weird.",
  				ll, ll);
 -		return false;
-+		return -EFSCORRUPTED;
++		goto corrupt;
  	}
  	vol->mftmirr_lcn = ll;
  	ntfs_debug("vol->mftmirr_lcn = 0x%llx", vol->mftmirr_lcn);
-@@ -1050,7 +1052,7 @@ static bool parse_ntfs_boot_sector(struct ntfs_volume *vol,
+@@ -1050,7 +1050,11 @@ static bool parse_ntfs_boot_sector(struct ntfs_volume *vol,
  		}
  	}
  
 -	return true;
 +	return 0;
++
++corrupt:
++	ntfs_report_metadata_error(vol, -EFSCORRUPTED);
++	return -EFSCORRUPTED;
  }
  
  /*
-@@ -1127,6 +1129,18 @@ static void ntfs_setup_allocators(struct ntfs_volume *vol)
+@@ -1127,6 +1131,18 @@ static void ntfs_setup_allocators(struct ntfs_volume *vol)
  	ntfs_debug("vol->mft_data_pos = 0x%llx", vol->mft_data_pos);
  }
  
@@ -248,7 +252,7 @@ index 9bf5a626abbc..afee1b262a12 100644
  static struct lock_class_key mftmirr_runlist_lock_key,
  			     mftmirr_mrec_lock_key;
  /*
-@@ -1142,7 +1156,7 @@ static bool load_and_init_mft_mirror(struct ntfs_volume *vol)
+@@ -1142,7 +1158,7 @@ static bool load_and_init_mft_mirror(struct ntfs_volume *vol)
  
  	ntfs_debug("Entering.");
  	/* Get mft mirror inode. */
@@ -257,39 +261,77 @@ index 9bf5a626abbc..afee1b262a12 100644
  	if (IS_ERR(tmp_ino)) {
  		if (!IS_ERR(tmp_ino))
  			iput(tmp_ino);
-@@ -1242,6 +1256,7 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
+@@ -1194,6 +1210,7 @@ static bool load_and_init_mft_mirror(struct ntfs_volume *vol)
+  */
+ static bool check_mft_mirror(struct ntfs_volume *vol)
+ {
++	int report_err = 0;
+ 	struct super_block *sb = vol->sb;
+ 	struct ntfs_inode *mirr_ni;
+ 	struct folio *mft_folio = NULL, *mirr_folio = NULL;
+@@ -1222,7 +1239,7 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
+ 					index, NULL);
+ 			if (IS_ERR(mft_folio)) {
+ 				ntfs_error(sb, "Failed to read $MFT.");
+-				return false;
++				goto out;
+ 			}
+ 			kmft_base = kmap_local_folio(mft_folio, 0);
+ 			kmft = kmft_base;
+@@ -1242,6 +1259,7 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
  		if (((struct mft_record *)kmft)->flags & MFT_RECORD_IN_USE) {
  			/* Make sure the record is ok. */
  			if (ntfs_is_baad_recordp((__le32 *)kmft)) {
-+				ntfs_report_metadata_error(vol, -EFSCORRUPTED);
++				report_err = -EFSCORRUPTED;
  				ntfs_error(sb,
  					"Incomplete multi sector transfer detected in mft record %i.",
  					i);
-@@ -1257,6 +1272,7 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
+@@ -1251,12 +1269,13 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
+ mft_unmap_out:
+ 				kunmap_local(kmft_base);
+ 				folio_put(mft_folio);
+-				return false;
++				goto out;
+ 			}
+ 		}
  		/* Do not check the mirror record if it is not in use. */
  		if (((struct mft_record *)kmirr)->flags & MFT_RECORD_IN_USE) {
  			if (ntfs_is_baad_recordp((__le32 *)kmirr)) {
-+				ntfs_report_metadata_error(vol, -EFSCORRUPTED);
++				report_err = -EFSCORRUPTED;
  				ntfs_error(sb,
  					"Incomplete multi sector transfer detected in mft mirror record %i.",
  					i);
-@@ -1276,6 +1292,7 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
+@@ -1276,6 +1295,7 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
  		}
  		/* Compare the two records. */
  		if (memcmp(kmft, kmirr, bytes)) {
-+			ntfs_report_metadata_error(vol, -EFSCORRUPTED);
++			report_err = -EFSCORRUPTED;
  			ntfs_error(sb,
  				   "$MFT and $MFTMirr record %i do not match.  Run chkdsk.",
  				   i);
-@@ -1310,6 +1327,7 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
+@@ -1310,14 +1330,20 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
  	do {
  		if (rl2[i].vcn != rl[i].vcn || rl2[i].lcn != rl[i].lcn ||
  				rl2[i].length != rl[i].length) {
-+			ntfs_report_metadata_error(vol, -EFSCORRUPTED);
++			report_err = -EFSCORRUPTED;
  			ntfs_error(sb, "$MFTMirr location mismatch.  Run chkdsk.");
  			up_read(&mirr_ni->runlist.lock);
- 			return false;
-@@ -2741,9 +2759,10 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
+-			return false;
++			goto out;
+ 		}
+ 	} while (rl2[i++].length);
+ 	up_read(&mirr_ni->runlist.lock);
+ 	ntfs_debug("Done.");
+ 	return true;
++
++out:
++	if (report_err)
++		ntfs_report_metadata_error(vol, report_err);
++	return false;
+ }
+ 
+ /*
+@@ -2741,9 +2767,10 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
  	 */
  	result = parse_ntfs_boot_sector(vol, (struct ntfs_boot_sector *)boot);
  	kfree(boot);
@@ -302,7 +344,7 @@ index 9bf5a626abbc..afee1b262a12 100644
  		goto err_out_now;
  	}
  	if (!vol->mft_write_supported && !sb_rdonly(sb)) {
-@@ -2795,6 +2814,7 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
+@@ -2795,6 +2822,7 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
  		ntfs_set_default_dentry_ops(sb);
  	tmp_ino = new_inode(sb);
  	if (!tmp_ino) {
@@ -310,7 +352,7 @@ index 9bf5a626abbc..afee1b262a12 100644
  		if (!silent)
  			ntfs_error(sb, "Failed to load essential metadata.");
  		goto err_out_now;
-@@ -2802,7 +2822,8 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
+@@ -2802,7 +2830,8 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
  
  	tmp_ino->i_ino = FILE_MFT;
  	insert_inode_hash(tmp_ino);
@@ -320,7 +362,7 @@ index 9bf5a626abbc..afee1b262a12 100644
  		if (!silent)
  			ntfs_error(sb, "Failed to load essential metadata.");
  		goto iput_tmp_ino_err_out_now;
-@@ -2826,6 +2847,7 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
+@@ -2826,6 +2855,7 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
  	vol->lcn_empty_bits_per_page = kvmalloc_array(lcn_bit_pages, sizeof(unsigned int),
  						      GFP_KERNEL);
  	if (!vol->lcn_empty_bits_per_page) {
@@ -328,7 +370,7 @@ index 9bf5a626abbc..afee1b262a12 100644
  		ntfs_error(sb,
  			   "Unable to allocate pages for storing LCN empty bit counts\n");
  		goto unl_upcase_iput_tmp_ino_err_out_now;
-@@ -2876,6 +2898,7 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
+@@ -2876,6 +2906,7 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
  		queue_work(ntfs_wq, &vol->precalc_work);
  		return 0;
  	}

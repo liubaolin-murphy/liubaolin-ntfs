@@ -1,7 +1,7 @@
-From 7087d50154b3f08528e17e773dd4e8ef409da2ec Mon Sep 17 00:00:00 2001
-From: Baolin Liu <liubaolin@kylinos.cn>
-Date: Mon, 26 Oct 2026 17:55:14 +0800
-Subject: [PATCH v5 00/31] ntfs: report filesystem errors through fsnotify
+From d67668b73e46c7c13e58319dc4c02487e73fc7eb Mon Sep 17 00:00:00 2001
+From: Xuewen Wang <wangxuewen@kylinos.cn>
+Date: Thu, 29 Oct 2026 13:56:08 +0800
+Subject: [PATCH v5 00/31] ntfs: report metadata errors and shutdown through FAN_FS_ERROR
 
 Report NTFS metadata corruption, failed recovery and shutdown through
 FAN_FS_ERROR. File events identify the affected base file; volume events
@@ -31,6 +31,40 @@ Changes since v4:
   Return and report EUCLEAN when it detects corruption.
 - Preserve the upstream logfile USA count widening and adapt to the
   current iomap code and const mnt_idmap interfaces.
+- Make ntfs_attr_exist() distinguish an absent attribute from search
+  context or lookup failures, and update every caller.
+- Route the remaining ntfs_read_inode_mount() failure through common
+  cleanup so it returns the specific errno instead of -1.
+- Consolidate local metadata reports at shared error exits throughout
+  the series. Keep independent recovery failures and reports for
+  different inodes separate.
+- Audit EA read errors: missing required attributes with HasEA set are
+  corruption; lower-level read errors retain their reports. Check HasEA
+  under mrec_lock and use EFBIG for the readall implementation limit.
+- Report EIO from LZNT1 block reads and nonresident WOF chunk reads;
+  retain allocation errors and lower-level resident-read reporting.
+- Preserve non-ENOENT failures while mapping the complete runlist,
+  report failed resident-record restoration, and avoid repeating
+  lower-level reports in the EA setter.
+- Report failed attribute-list persistence after extent-entry changes,
+  including space-making for mapping pairs or record relocation. Preserve
+  original resident-resize and relocation errors instead of replacing
+  them with ENOSPC or ENOMEM.
+- Avoid duplicate reports when the attribute-list updater already reported
+  the failure, including resident relocation and list-entry removal.
+- Avoid reporting resident WOF table read errors again when the MFT or
+  attribute lookup path already reported them.
+- Consolidate index bitmap-clear reporting in the modifier so the clear
+  wrapper does not repeat the same local error report.
+- Treat positive reparse-index cleanup lengths as success during create
+  rollback; report only negative errors.
+- Report malformed fully mapped runlists rejected by insert/collapse/punch
+  helpers as EUCLEAN. Keep invalid ranges and allocation failures distinct.
+- Report insert-range allocation failure after an in-place split or merge.
+  Leave allocation failures before any runlist change unreported.
+- Avoid repeating record-removal reports in the outer removal loop,
+  and propagated read-corruption reports in index-block reads and
+  bitmap allocation. Keep reports for failed cleanup and local checks.
 - Recheck reporting paths on the rebased tree and rerun the validation
   listed below, including targeted tests of the new INDX offset check.
 
@@ -50,7 +84,7 @@ The search-context API conversion stays together with all its callers.
 
 Series organization:
 - 1-4: writeback errno propagation, cluster-free counts, reporting
-  helpers and search-context initialization errors.
+  helpers and search-context/attribute-existence error propagation.
 - 5-7: boot/MFT bootstrap, required system files and logfile errors.
 - 8-10: runlists/cluster allocation, iomap and LZNT1/WOF streams.
 - 11-17: attribute moves, lookup, record/list updates, conversion,
@@ -62,7 +96,7 @@ Series organization:
 - 28-30: EA/ACLs, named streams and reparse/ObjectID metadata.
 - 31: atomic shutdown reporting.
 
-Validation on the final v5 tree:
+Validation:
 - Built all NTFS objects and the bootable kernel with W=1.
 - Sparse C=2 checked all 31 NTFS translation units without diagnostics.
 - Passed 13 QEMU guest runs with NTFS built in, including normal file
@@ -72,8 +106,31 @@ Validation on the final v5 tree:
 - Two of those runs specifically exercised INDX entries_offset below
   the new minimum, through lookup and readdir. Both operations returned
   EUCLEAN and generated EUCLEAN events after the listener was ready.
-- These runs used KCSAN and lockdep; KCSAN selftests passed, and no
-  KCSAN or lockdep diagnostics were printed.
+- Tested 374 controlled error-path scenarios using extracted, unmodified
+  functions, including every ntfs_attr_exist() caller and EA/readall
+  error classification, LZNT1/WOF read failures, runlist lookup errors,
+  resident-record restoration, EA setter reporting and failed
+  relocation/list persistence, including duplicate-report suppression.
+  Forty of these cases cover index bitmap set/clear errors and local
+  duplicate-report suppression. These are userspace harness tests with
+  controlled dependencies. Eighteen cases check reparse-index cleanup
+  return values, including successful positive lengths.
+  Twenty-four additional cases check duplicate-report suppression in the
+  two resident-attribute relocation paths.
+  Thirty further cases exercise the real WOF table parser and chunk reader,
+  including lower-layer errors and local corruption checks.
+  Twelve cases check list-entry removal reporting and early failures.
+  Thirty cases exercise real range-editing helpers with malformed
+  runlists, valid ranges and allocation failures before and after changes.
+  Forty-two additional cases exercise nested attribute removal and
+  index/bitmap reads, distinguishing propagated corruption from local
+  detection, I/O errors and independent failed cleanup.
+- A separate test kernel injected ENOMEM, EIO, EUCLEAN and ENOENT at the
+  inner MFT bootstrap read on an earlier V5 tree. That function is
+  unchanged by this follow-up. The first three errnos were preserved;
+  missing required metadata was returned as EUCLEAN.
+- The QEMU test runs used non-strict KCSAN and lockdep; all 3 KCSAN
+  selftests passed, and no KCSAN or lockdep diagnostics were printed.
 
 Thanks to Hyunchul and Namjae for reviewing the earlier versions.
 
@@ -115,33 +172,32 @@ Xuewen Wang (9):
   ntfs: report reparse and object ID metadata errors
 
  fs/ntfs/aops.c         |  24 +-
- fs/ntfs/attrib.c       | 738 ++++++++++++++++++++++++++++++-----------
+ fs/ntfs/attrib.c       | 890 ++++++++++++++++++++++++++++++-----------
  fs/ntfs/attrib.h       |   8 +-
- fs/ntfs/attrlist.c     |  43 ++-
+ fs/ntfs/attrlist.c     |  61 ++-
+ fs/ntfs/attrlist.h     |   4 +-
  fs/ntfs/bitmap.c       |   2 +-
- fs/ntfs/compress.c     |  30 +-
- fs/ntfs/dir.c          | 108 ++++--
- fs/ntfs/ea.c           |  84 +++--
- fs/ntfs/file.c         |  27 +-
- fs/ntfs/index.c        | 316 ++++++++++++------
- fs/ntfs/inode.c        | 265 ++++++++++-----
+ fs/ntfs/compress.c     |  35 +-
+ fs/ntfs/dir.c          | 112 ++++--
+ fs/ntfs/ea.c           | 173 +++++---
+ fs/ntfs/file.c         |  30 +-
+ fs/ntfs/index.c        | 349 ++++++++++------
+ fs/ntfs/inode.c        | 266 ++++++++----
  fs/ntfs/inode.h        |  10 +-
- fs/ntfs/iomap.c        |  53 ++-
+ fs/ntfs/iomap.c        |  66 ++-
  fs/ntfs/lcnalloc.c     |  17 +-
- fs/ntfs/logfile.c      |  51 +--
- fs/ntfs/mft.c          | 326 +++++++++++-------
- fs/ntfs/named_stream.c |  55 ++-
- fs/ntfs/namei.c        | 140 ++++++--
- fs/ntfs/object_id.c    |  40 ++-
- fs/ntfs/reparse.c      |  98 ++++--
+ fs/ntfs/logfile.c      |  58 +--
+ fs/ntfs/mft.c          | 351 ++++++++++------
+ fs/ntfs/named_stream.c |  61 ++-
+ fs/ntfs/namei.c        | 144 +++++--
+ fs/ntfs/object_id.c    |  50 ++-
+ fs/ntfs/reparse.c      | 109 ++++-
  fs/ntfs/reparse.h      |   2 +-
- fs/ntfs/runlist.c      |  16 +-
- fs/ntfs/runlist.h      |   1 +
+ fs/ntfs/runlist.c      |  23 +-
+ fs/ntfs/runlist.h      |   4 +-
  fs/ntfs/stream.h       |   2 +-
- fs/ntfs/super.c        | 279 +++++++++++-----
+ fs/ntfs/super.c        | 310 ++++++++++----
  fs/ntfs/volume.h       |   4 +
- fs/ntfs/wof.c          |  41 ++-
- 27 files changed, 1967 insertions(+), 813 deletions(-)
+ fs/ntfs/wof.c          |  49 ++-
+ 28 files changed, 2287 insertions(+), 927 deletions(-)
 
-
-base-commit: 5dffb7307023d909277cb5f5f3f18f32afa31e2f

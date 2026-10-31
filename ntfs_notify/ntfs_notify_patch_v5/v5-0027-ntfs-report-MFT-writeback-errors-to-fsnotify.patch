@@ -1,4 +1,4 @@
-From 9bae25420689d00417c32bd740581a729ae95848 Mon Sep 17 00:00:00 2001
+From 80e9194c984a80d0c92a106dff8efeefe400ed8c Mon Sep 17 00:00:00 2001
 From: Baolin Liu <liubaolin@kylinos.cn>
 Date: Wed, 14 Oct 2026 07:39:10 +0800
 Subject: [PATCH v5 27/31] ntfs: report MFT writeback errors to fsnotify
@@ -21,7 +21,7 @@ Signed-off-by: Baolin Liu <liubaolin@kylinos.cn>
  1 file changed, 36 insertions(+), 18 deletions(-)
 
 diff --git a/fs/ntfs/mft.c b/fs/ntfs/mft.c
-index cc264a0fc073..6f84a4e78aa4 100644
+index 7290feeb1803..f5092666b688 100644
 --- a/fs/ntfs/mft.c
 +++ b/fs/ntfs/mft.c
 @@ -479,9 +479,11 @@ static void ntfs_mft_end_io(struct bio *bio)
@@ -135,7 +135,7 @@ index cc264a0fc073..6f84a4e78aa4 100644
  	return err;
  }
  
-@@ -3165,7 +3180,7 @@ static int ntfs_map_mft_io_locked(struct ntfs_inode *ni, u64 folio_byte,
+@@ -3180,7 +3195,7 @@ static int ntfs_map_mft_io_locked(struct ntfs_inode *ni, u64 folio_byte,
  
  	lockdep_assert_held(&ni->runlist.lock);
  	if (!ni->runlist.rl)
@@ -144,7 +144,7 @@ index cc264a0fc073..6f84a4e78aa4 100644
  
  	vcn = ntfs_bytes_to_cluster(vol, file_ofs);
  	/*
-@@ -3177,10 +3192,10 @@ static int ntfs_map_mft_io_locked(struct ntfs_inode *ni, u64 folio_byte,
+@@ -3192,10 +3207,10 @@ static int ntfs_map_mft_io_locked(struct ntfs_inode *ni, u64 folio_byte,
  	if (lcn == LCN_RL_NOT_MAPPED)
  		return -EAGAIN;
  	if (lcn < 0)
@@ -157,7 +157,7 @@ index cc264a0fc073..6f84a4e78aa4 100644
  
  	unit->sector = ntfs_bytes_to_bio_sector(
  		NTFS_CLU_TO_B(vol, lcn) +
-@@ -3271,7 +3286,7 @@ static void ntfs_mft_write_error(struct ntfs_volume *vol,
+@@ -3286,7 +3301,7 @@ static void ntfs_mft_write_error(struct ntfs_volume *vol,
  				 struct address_space *mapping, int err)
  {
  	mapping_set_error(mapping, err);
@@ -166,7 +166,7 @@ index cc264a0fc073..6f84a4e78aa4 100644
  	ntfs_error(vol->sb, "Error while writing MFT folio: %d", err);
  }
  
-@@ -3375,8 +3390,10 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
+@@ -3390,8 +3405,10 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
  	err = ntfs_prepare_mft_folio_units(ni, folio_byte, file_limit,
  					   record_selected, units, &nr_units,
  					   max_units, &defer);
@@ -178,7 +178,7 @@ index cc264a0fc073..6f84a4e78aa4 100644
  	if (!nr_units) {
  		if (defer)
  			goto out_noio;
-@@ -3429,6 +3446,7 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
+@@ -3444,6 +3461,7 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
  						ctx->error = -EIO;
  					redirty = true;
  					err = -EIO;

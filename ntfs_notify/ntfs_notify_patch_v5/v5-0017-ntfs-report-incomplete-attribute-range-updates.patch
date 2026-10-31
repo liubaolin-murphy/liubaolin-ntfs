@@ -1,4 +1,4 @@
-From ec1f177802c8edb8530d4396ac9c81c6637ce770 Mon Sep 17 00:00:00 2001
+From 0233ea78e0d8c12631aeb554987006703cd87a07 Mon Sep 17 00:00:00 2001
 From: Dandan Wu <wudandan@kylinos.cn>
 Date: Wed, 14 Oct 2026 07:39:10 +0800
 Subject: [PATCH v5 17/31] ntfs: report incomplete attribute range updates
@@ -12,28 +12,80 @@ Use EFSCORRUPTED for missing required attributes and invalid runlist
 state. Report context and lookup failures after a range update, including
 ENOMEM, while keeping ordinary early allocation failures unreported.
 
+After validating the requested range, treat EINVAL from the runlist
+editing helpers as corruption and report it. Reject negative starts
+and nonpositive lengths separately, preserving EINVAL for bad input
+and ENOMEM for allocation failures.
+
+Track whether insertion split or merged an existing run before its
+runlist allocation failed. Report that unfinished update while leaving
+ENOMEM before any mutation unreported; do not change rollback behavior.
+
 Signed-off-by: Dandan Wu <wudandan@kylinos.cn>
 ---
- fs/ntfs/attrib.c | 47 ++++++++++++++++++++++++++++++++++++++---------
- 1 file changed, 38 insertions(+), 9 deletions(-)
+
+
+Range runlist validation:
+- Use the real insert, collapse and punch-hole helpers with malformed
+  terminators and gaps. Six cases return EINVAL without reporting
+  before the fix, and return/report EUCLEAN after it.
+- Three additional cases reproduce mutation before ENOMEM during a run
+  split or either merge; each unfinished update is now reported.
+- All 30 cases pass with ASan/UBSan, including valid operations,
+  allocation failure and invalid ranges; allocation tracking balances.
+- Userspace dependencies are controlled; no kernel hooks are included.
+
+ fs/ntfs/attrib.c  | 84 +++++++++++++++++++++++++++++++++++++++--------
+ fs/ntfs/runlist.c |  7 +++-
+ fs/ntfs/runlist.h |  3 +-
+ 3 files changed, 79 insertions(+), 15 deletions(-)
 
 diff --git a/fs/ntfs/attrib.c b/fs/ntfs/attrib.c
-index 62985be67a09..910c69da9e24 100644
+index aa0ee311a7e7..36ea7a2d1f36 100644
 --- a/fs/ntfs/attrib.c
 +++ b/fs/ntfs/attrib.c
-@@ -5952,9 +5952,10 @@ int ntfs_non_resident_attr_insert_range(struct ntfs_inode *ni, s64 start_vcn, s6
+@@ -5975,9 +5975,12 @@ int ntfs_non_resident_attr_insert_range(struct ntfs_inode *ni, s64 start_vcn, s6
+ 	struct ntfs_attr_search_ctx *ctx;
+ 	int ret;
+ 	size_t new_rl_count;
++	bool modified;
  
- 	rl = ntfs_rl_find_vcn_nolock(ni->runlist.rl, start_vcn);
+ 	if (ni->type != AT_DATA)
+ 		return -EOPNOTSUPP;
++	if (start_vcn < 0 || len <= 0)
++		return -EINVAL;
+ 	if (start_vcn > ntfs_bytes_to_cluster(vol, ni->allocated_size))
+ 		return -EINVAL;
+ 
+@@ -6003,15 +6006,24 @@ int ntfs_non_resident_attr_insert_range(struct ntfs_inode *ni, s64 start_vcn, s6
  	if (!rl) {
-+		ntfs_report_file_metadata_error(VFS_I(base_ni), -EFSCORRUPTED);
  		up_write(&ni->runlist.lock);
  		kfree(hole_rl);
 -		return -EIO;
-+		return -EFSCORRUPTED;
++		ret = -EFSCORRUPTED;
++		goto report_error;
  	}
  
  	rl = ntfs_rl_insert_range(ni->runlist.rl, (int)ni->runlist.count,
-@@ -5974,19 +5975,20 @@ int ntfs_non_resident_attr_insert_range(struct ntfs_inode *ni, s64 start_vcn, s6
+-				  hole_rl, 1, &new_rl_count);
++				  hole_rl, 1, &new_rl_count, &modified);
+ 	if (IS_ERR(rl)) {
+ 		up_write(&ni->runlist.lock);
+ 		kfree(hole_rl);
+-		return PTR_ERR(rl);
++		ret = PTR_ERR(rl);
++		/* Splitting or merging a run can precede allocation failure. */
++		if (modified)
++			goto report_error;
++		if (ret != -EINVAL)
++			return ret;
++		/* A valid range must be covered by the fully mapped runlist. */
++		ret = -EFSCORRUPTED;
++		goto report_error;
+ 	}
+ 	ni->runlist.rl =  rl;
+ 	ni->runlist.count = new_rl_count;
+@@ -6023,19 +6035,20 @@ int ntfs_non_resident_attr_insert_range(struct ntfs_inode *ni, s64 start_vcn, s6
  	ret = ntfs_attr_update_mapping_pairs_locked(ni, 0, ni);
  	up_write(&ni->runlist.lock);
  	if (ret)
@@ -57,7 +109,7 @@ index 62985be67a09..910c69da9e24 100644
  	}
  
  	ctx->attr->data.non_resident.data_size = cpu_to_le64(ni->data_size);
-@@ -5996,6 +5998,13 @@ int ntfs_non_resident_attr_insert_range(struct ntfs_inode *ni, s64 start_vcn, s6
+@@ -6045,6 +6058,13 @@ int ntfs_non_resident_attr_insert_range(struct ntfs_inode *ni, s64 start_vcn, s6
  	mark_mft_record_dirty(ctx->ntfs_ino);
  	ntfs_attr_put_search_ctx(ctx);
  	return ret;
@@ -65,96 +117,216 @@ index 62985be67a09..910c69da9e24 100644
 +report_error:
 +	if (ret == -ENOENT)
 +		ret = -EFSCORRUPTED;
-+	/* The runlist and sizes have already changed without rollback. */
++	/* Corruption or an unfinished update requires a report. */
 +	ntfs_report_file_metadata_error(VFS_I(base_ni), ret);
 +	return ret;
  }
  
  int ntfs_non_resident_attr_collapse_range(struct ntfs_inode *ni, s64 start_vcn, s64 len)
-@@ -6028,8 +6037,9 @@ int ntfs_non_resident_attr_collapse_range(struct ntfs_inode *ni, s64 start_vcn,
- 		dst_cnt++;
+@@ -6060,6 +6080,8 @@ int ntfs_non_resident_attr_collapse_range(struct ntfs_inode *ni, s64 start_vcn,
+ 
+ 	if (ni->type != AT_DATA)
+ 		return -EOPNOTSUPP;
++	if (start_vcn < 0 || len <= 0)
++		return -EINVAL;
+ 
+ 	end_vcn = ntfs_bytes_to_cluster(vol, ni->allocated_size);
+ 	if (start_vcn >= end_vcn)
+@@ -6078,14 +6100,20 @@ int ntfs_non_resident_attr_collapse_range(struct ntfs_inode *ni, s64 start_vcn,
  	rl = ntfs_rl_find_vcn_nolock(ni->runlist.rl, start_vcn);
  	if (!rl) {
-+		ntfs_report_file_metadata_error(VFS_I(base_ni), -EFSCORRUPTED);
  		up_write(&ni->runlist.lock);
 -		return -EIO;
-+		return -EFSCORRUPTED;
++		ret = -EFSCORRUPTED;
++		goto report_error;
  	}
  
  	rl = ntfs_rl_collapse_range(ni->runlist.rl, dst_cnt + 1,
-@@ -6090,6 +6100,11 @@ int ntfs_non_resident_attr_collapse_range(struct ntfs_inode *ni, s64 start_vcn,
+ 				    start_vcn, len, &punch_rl, &new_rl_cnt);
+ 	if (IS_ERR(rl)) {
+ 		up_write(&ni->runlist.lock);
+-		return PTR_ERR(rl);
++		ret = PTR_ERR(rl);
++		if (ret != -EINVAL)
++			return ret;
++		/* A valid range must be covered by the fully mapped runlist. */
++		ret = -EFSCORRUPTED;
++		goto report_error;
+ 	}
+ 	ni->runlist.rl = rl;
+ 	ni->runlist.count = new_rl_cnt;
+@@ -6139,8 +6167,14 @@ int ntfs_non_resident_attr_collapse_range(struct ntfs_inode *ni, s64 start_vcn,
  	if (ctx)
  		ntfs_attr_put_search_ctx(ctx);
  out_rl:
 +	if (ret == -ENOENT)
 +		ret = -EFSCORRUPTED;
-+	/* The range was removed from the runlist and cannot be restored. */
-+	if (ret)
-+		ntfs_report_file_metadata_error(VFS_I(base_ni), ret);
  	kvfree(punch_rl);
  	mark_mft_record_dirty(base_ni);
++
++report_error:
++	if (ret)
++		ntfs_report_file_metadata_error(VFS_I(base_ni), ret);
  	return ret;
-@@ -6124,8 +6139,9 @@ int ntfs_non_resident_attr_punch_hole(struct ntfs_inode *ni, s64 start_vcn, s64
- 		dst_cnt++;
+ }
+ 
+@@ -6156,6 +6190,8 @@ int ntfs_non_resident_attr_punch_hole(struct ntfs_inode *ni, s64 start_vcn, s64
+ 
+ 	if (ni->type != AT_DATA)
+ 		return -EOPNOTSUPP;
++	if (start_vcn < 0 || len <= 0)
++		return -EINVAL;
+ 
+ 	end_vcn = ntfs_bytes_to_cluster(vol, ni->allocated_size);
+ 	if (start_vcn >= end_vcn)
+@@ -6174,14 +6210,20 @@ int ntfs_non_resident_attr_punch_hole(struct ntfs_inode *ni, s64 start_vcn, s64
  	rl = ntfs_rl_find_vcn_nolock(ni->runlist.rl, start_vcn);
  	if (!rl) {
-+		ntfs_report_file_metadata_error(VFS_I(base_ni), -EFSCORRUPTED);
  		up_write(&ni->runlist.lock);
 -		return -EIO;
-+		return -EFSCORRUPTED;
++		ret = -EFSCORRUPTED;
++		goto report_error;
  	}
  
  	rl = ntfs_rl_punch_hole(ni->runlist.rl, dst_cnt + 1,
-@@ -6140,13 +6156,16 @@ int ntfs_non_resident_attr_punch_hole(struct ntfs_inode *ni, s64 start_vcn, s64
- 	ret = ntfs_attr_update_mapping_pairs_locked(ni, 0, ni);
+ 				start_vcn, len, &punch_rl, &new_rl_count);
+ 	if (IS_ERR(rl)) {
+ 		up_write(&ni->runlist.lock);
+-		return PTR_ERR(rl);
++		ret = PTR_ERR(rl);
++		if (ret != -EINVAL)
++			return ret;
++		/* A valid range must be covered by the fully mapped runlist. */
++		ret = -EFSCORRUPTED;
++		goto report_error;
+ 	}
+ 	ni->runlist.rl = rl;
+ 	ni->runlist.count = new_rl_count;
+@@ -6190,7 +6232,7 @@ int ntfs_non_resident_attr_punch_hole(struct ntfs_inode *ni, s64 start_vcn, s64
  	up_write(&ni->runlist.lock);
  	if (ret) {
-+		ntfs_report_file_metadata_error(VFS_I(base_ni), ret);
  		kvfree(punch_rl);
- 		return ret;
+-		return ret;
++		goto report_error;
  	}
  
  	ret = ntfs_cluster_free_from_rl(vol, punch_rl);
--	if (ret)
-+	if (ret) {
-+		ntfs_report_file_metadata_error(VFS_I(base_ni), ret);
- 		ntfs_error(vol->sb, "Freeing of clusters failed");
-+	}
+@@ -6199,11 +6241,16 @@ int ntfs_non_resident_attr_punch_hole(struct ntfs_inode *ni, s64 start_vcn, s64
  
  	kvfree(punch_rl);
  	mark_mft_record_dirty(base_ni);
-@@ -6195,7 +6214,11 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
++
++report_error:
++	if (ret)
++		ntfs_report_file_metadata_error(VFS_I(base_ni), ret);
+ 	return ret;
+ }
+ 
+ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bool keep_size)
+ {
++	int report_err = 0;
+ 	struct ntfs_inode *base_ni = ntfs_base_inode(ni);
+ 	struct ntfs_volume *vol = ni->vol;
+ 	struct mft_record *mrec;
+@@ -6244,7 +6291,10 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
  	err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
  			CASE_SENSITIVE, 0, NULL, 0, ctx);
  	if (err) {
 -		err = -EIO;
 +		if (err == -ENOENT) {
 +			err = -EFSCORRUPTED;
-+			ntfs_report_file_metadata_error(VFS_I(base_ni),
-+							-EFSCORRUPTED);
++			report_err = -EFSCORRUPTED;
 +		}
  		goto out_unmap;
  	}
  
-@@ -6210,7 +6233,9 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
+@@ -6259,7 +6309,9 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
  					CASE_SENSITIVE, 0, NULL, 0,
  					ctx);
  			if (err) {
 -				err = -EIO;
 +				if (err == -ENOENT)
 +					err = -EFSCORRUPTED;
-+				ntfs_report_file_metadata_error(VFS_I(base_ni), err);
++				report_err = err;
  				goto out_unmap;
  			}
  			ni->data_size = old_data_size;
-@@ -6296,6 +6321,10 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
+@@ -6345,6 +6397,10 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
  			}
  		} else {
  			err = -EIO;
 +			if (rl_lcn < LCN_HOLE) {
 +				err = -EFSCORRUPTED;
-+				ntfs_report_file_metadata_error(VFS_I(base_ni), err);
++				report_err = err;
 +			}
  			goto out;
  		}
  	}
+@@ -6384,6 +6440,8 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
+ 	unmap_mft_record(base_ni);
+ 	mutex_unlock(&base_ni->mrec_lock);
+ out:
++	if (report_err)
++		ntfs_report_file_metadata_error(VFS_I(base_ni), report_err);
+ 	return err >= 0 ? 0 : err;
+ signal_out:
+ 	if (!err)
+diff --git a/fs/ntfs/runlist.c b/fs/ntfs/runlist.c
+index 606a30ab9fa7..088a9e03e79b 100644
+--- a/fs/ntfs/runlist.c
++++ b/fs/ntfs/runlist.c
+@@ -1790,13 +1790,15 @@ static inline bool ntfs_rle_contain(struct runlist_element *rle, s64 vcn)
+ 
+ struct runlist_element *ntfs_rl_insert_range(struct runlist_element *dst_rl, int dst_cnt,
+ 				      struct runlist_element *src_rl, int src_cnt,
+-				      size_t *new_rl_cnt)
++				      size_t *new_rl_cnt, bool *modified)
+ {
+ 	struct runlist_element *i_rl, *new_rl, *src_rl_origin = src_rl;
+ 	struct runlist_element dst_rl_split;
+ 	s64 start_vcn;
+ 	int new_1st_cnt, new_2nd_cnt, new_3rd_cnt, new_cnt;
+ 
++	/* Tell the caller if an error leaves the original runlist changed. */
++	*modified = false;
+ 	if (!dst_rl || !src_rl || !new_rl_cnt)
+ 		return ERR_PTR(-EINVAL);
+ 	if (dst_cnt <= 0 || src_cnt <= 0)
+@@ -1833,6 +1835,7 @@ struct runlist_element *ntfs_rl_insert_range(struct runlist_element *dst_rl, int
+ 		i_rl[0].vcn = start_vcn;
+ 		i_rl[0].length -= dst_rl_split.length;
+ 		i_rl[0].lcn += dst_rl_split.length;
++		*modified = true;
+ 	} else {
+ 		struct runlist_element *dst_rle, *src_rle;
+ merge_src_rle:
+@@ -1846,6 +1849,7 @@ struct runlist_element *ntfs_rl_insert_range(struct runlist_element *dst_rl, int
+ 		if (new_1st_cnt > 0 && ntfs_rle_lcn_contiguous(dst_rle, src_rle)) {
+ 			WARN_ON(dst_rle->vcn + dst_rle->length != src_rle->vcn);
+ 			dst_rle->length += src_rle->length;
++			*modified = true;
+ 			src_rl++;
+ 			src_cnt--;
+ 		} else {
+@@ -1855,6 +1859,7 @@ struct runlist_element *ntfs_rl_insert_range(struct runlist_element *dst_rl, int
+ 
+ 			if (ntfs_rle_lcn_contiguous(dst_rle, src_rle)) {
+ 				dst_rle->length += src_rle->length;
++				*modified = true;
+ 				src_cnt--;
+ 			}
+ 		}
+diff --git a/fs/ntfs/runlist.h b/fs/ntfs/runlist.h
+index 85073f9fb6ec..14a2a626ba56 100644
+--- a/fs/ntfs/runlist.h
++++ b/fs/ntfs/runlist.h
+@@ -89,7 +89,8 @@ int ntfs_rl_truncate_nolock(const struct ntfs_volume *vol,
+ int ntfs_rl_sparse(struct runlist_element *rl);
+ s64 ntfs_rl_get_compressed_size(struct ntfs_volume *vol, struct runlist_element *rl);
+ struct runlist_element *ntfs_rl_insert_range(struct runlist_element *dst_rl, int dst_cnt,
+-		struct runlist_element *src_rl, int src_cnt, size_t *new_cnt);
++		struct runlist_element *src_rl, int src_cnt, size_t *new_cnt,
++		bool *modified);
+ struct runlist_element *ntfs_rl_punch_hole(struct runlist_element *dst_rl, int dst_cnt,
+ 		s64 start_vcn, s64 len, struct runlist_element **punch_rl,
+ 		size_t *new_rl_cnt);

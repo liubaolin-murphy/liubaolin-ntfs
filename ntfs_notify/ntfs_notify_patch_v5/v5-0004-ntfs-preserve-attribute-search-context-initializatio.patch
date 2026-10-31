@@ -1,4 +1,4 @@
-From 39d781c107255869c6e61b229deab7d419f4b0f5 Mon Sep 17 00:00:00 2001
+From ccaa4613bc7b54d57522e0f78afc88a0f999d62b Mon Sep 17 00:00:00 2001
 From: Xuewen Wang <wangxuewen@kylinos.cn>
 Date: Wed, 14 Oct 2026 07:39:10 +0800
 Subject: [PATCH v5 04/31] ntfs: preserve attribute search context
@@ -7,31 +7,33 @@ Subject: [PATCH v5 04/31] ntfs: preserve attribute search context
 ntfs_attr_get_search_ctx() returns NULL for both allocation and MFT
 mapping failures, causing callers to misreport mapping errors as ENOMEM.
 
-Return error pointers carrying the original errno. Convert all callers
-and the documented usage, clearing pointers before shared cleanup where
-needed. Preserve deliberate boolean and best-effort behavior while making
-those callers recognize error pointers.
+Return error pointers carrying the original errno and convert all callers
+and the documented usage. Clear error pointers before shared cleanup.
+Make ntfs_attr_exist() return 1 for present, 0 only for a lookup miss and
+a negative errno on failure. Update the index and reparse callers so a
+failed lookup cannot be mistaken for an absent attribute.
 
 Signed-off-by: Xuewen Wang <wangxuewen@kylinos.cn>
 ---
- fs/ntfs/attrib.c       | 110 ++++++++++++++++++++++-------------------
+ fs/ntfs/attrib.c       | 117 ++++++++++++++++++++++-------------------
  fs/ntfs/attrib.h       |   4 +-
  fs/ntfs/attrlist.c     |   5 +-
  fs/ntfs/dir.c          |  18 ++++---
  fs/ntfs/ea.c           |  10 ++--
  fs/ntfs/file.c         |   4 +-
- fs/ntfs/index.c        |   3 +-
- fs/ntfs/inode.c        |  51 ++++++++++---------
+ fs/ntfs/index.c        |  14 +++--
+ fs/ntfs/inode.c        |  51 ++++++++++--------
  fs/ntfs/iomap.c        |  10 ++--
- fs/ntfs/mft.c          |  23 +++++----
+ fs/ntfs/mft.c          |  23 ++++----
  fs/ntfs/named_stream.c |  18 ++++---
  fs/ntfs/namei.c        |  13 ++---
- fs/ntfs/super.c        |  14 ++++--
+ fs/ntfs/reparse.c      |   7 ++-
+ fs/ntfs/super.c        |  14 +++--
  fs/ntfs/wof.c          |  10 ++--
- 14 files changed, 164 insertions(+), 129 deletions(-)
+ 15 files changed, 183 insertions(+), 135 deletions(-)
 
 diff --git a/fs/ntfs/attrib.c b/fs/ntfs/attrib.c
-index 0be410973176..28099ed6ad99 100644
+index 0be410973176..42608c9f8069 100644
 --- a/fs/ntfs/attrib.c
 +++ b/fs/ntfs/attrib.c
 @@ -120,8 +120,9 @@ int ntfs_map_runlist_nolock(struct ntfs_inode *ni, s64 vcn, struct ntfs_attr_sea
@@ -288,7 +290,15 @@ index 0be410973176..28099ed6ad99 100644
  	}
  	while (!(err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
  				CASE_SENSITIVE, 0, NULL, 0, ctx))) {
-@@ -5476,7 +5480,7 @@ int ntfs_attr_exist(struct ntfs_inode *ni, const __le32 type, __le16 *name,
+@@ -5466,6 +5470,7 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
+ 	return ret;
+ }
+ 
++/* Return 1 if present, 0 if absent, or a negative errno on failure. */
+ int ntfs_attr_exist(struct ntfs_inode *ni, const __le32 type, __le16 *name,
+ 		u32 name_len)
+ {
+@@ -5476,10 +5481,10 @@ int ntfs_attr_exist(struct ntfs_inode *ni, const __le32 type, __le16 *name,
  	ntfs_debug("Entering\n");
  
  	ctx = ntfs_attr_get_search_ctx(ni, NULL);
@@ -296,8 +306,23 @@ index 0be410973176..28099ed6ad99 100644
 +	if (IS_ERR(ctx)) {
  		ntfs_error(ni->vol->sb, "%s: Failed to get search context",
  				__func__);
- 		return 0;
-@@ -5661,8 +5665,8 @@ int ntfs_non_resident_attr_insert_range(struct ntfs_inode *ni, s64 start_vcn, s6
+-		return 0;
++		return PTR_ERR(ctx);
+ 	}
+ 
+ 	ic = type == AT_DATA && name_len ? IGNORE_CASE : CASE_SENSITIVE;
+@@ -5487,7 +5492,9 @@ int ntfs_attr_exist(struct ntfs_inode *ni, const __le32 type, __le16 *name,
+ 			0, NULL, 0, ctx);
+ 	ntfs_attr_put_search_ctx(ctx);
+ 
+-	return !ret;
++	if (ret == -ENOENT)
++		return 0;
++	return ret ? ret : 1;
+ }
+ 
+ /*
+@@ -5661,8 +5668,8 @@ int ntfs_non_resident_attr_insert_range(struct ntfs_inode *ni, s64 start_vcn, s6
  		return ret;
  
  	ctx = ntfs_attr_get_search_ctx(base_ni, NULL);
@@ -308,7 +333,7 @@ index 0be410973176..28099ed6ad99 100644
  		return ret;
  	}
  
-@@ -5750,8 +5754,9 @@ int ntfs_non_resident_attr_collapse_range(struct ntfs_inode *ni, s64 start_vcn,
+@@ -5750,8 +5757,9 @@ int ntfs_non_resident_attr_collapse_range(struct ntfs_inode *ni, s64 start_vcn,
  	up_write(&ni->runlist.lock);
  
  	ctx = ntfs_attr_get_search_ctx(base_ni, NULL);
@@ -320,7 +345,7 @@ index 0be410973176..28099ed6ad99 100644
  		goto out_rl;
  	}
  
-@@ -5869,8 +5874,9 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
+@@ -5869,8 +5877,9 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
  	}
  
  	ctx = ntfs_attr_get_search_ctx(base_ni, mrec);
@@ -459,7 +484,7 @@ index b2f5882d9990..16fdb649d0c2 100644
  	mutex_lock_nested(&ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL_CHILD);
  	while (!(err = ntfs_attr_lookup(AT_UNUSED, NULL, 0, 0, 0, NULL, 0, ctx))) {
 diff --git a/fs/ntfs/index.c b/fs/ntfs/index.c
-index 66411a712b14..9881de5779ba 100644
+index 66411a712b14..e719d3afcfb0 100644
 --- a/fs/ntfs/index.c
 +++ b/fs/ntfs/index.c
 @@ -597,8 +597,9 @@ static struct index_root *ntfs_ir_lookup(struct ntfs_inode *ni, __le16 *name,
@@ -473,6 +498,31 @@ index 66411a712b14..9881de5779ba 100644
  		return NULL;
  	}
  
+@@ -1039,8 +1040,9 @@ static int ntfs_ibm_add(struct ntfs_index_context *icx)
+ 
+ 	ntfs_debug("Entering\n");
+ 
+-	if (ntfs_attr_exist(icx->idx_ni, AT_BITMAP, icx->name, icx->name_len))
+-		return 0;
++	ret = ntfs_attr_exist(icx->idx_ni, AT_BITMAP, icx->name, icx->name_len);
++	if (ret)
++		return ret < 0 ? ret : 0;
+ 	/*
+ 	 * AT_BITMAP must be at least 8 bytes.
+ 	 */
+@@ -1282,7 +1284,11 @@ static int ntfs_ia_add(struct ntfs_index_context *icx)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (!ntfs_attr_exist(icx->idx_ni, AT_INDEX_ALLOCATION, icx->name, icx->name_len)) {
++	ret = ntfs_attr_exist(icx->idx_ni, AT_INDEX_ALLOCATION, icx->name,
++			      icx->name_len);
++	if (ret < 0)
++		return ret;
++	if (!ret) {
+ 		ret = ntfs_attr_add(icx->idx_ni, AT_INDEX_ALLOCATION, icx->name,
+ 					icx->name_len, NULL, 0);
+ 		if (ret) {
 diff --git a/fs/ntfs/inode.c b/fs/ntfs/inode.c
 index c8560dd47d44..5b3d1453d5e1 100644
 --- a/fs/ntfs/inode.c
@@ -801,6 +851,24 @@ index 62b01646c262..998f642b9f22 100644
  	}
  try_next:
  	err = ntfs_attr_lookup(AT_FILE_NAME, NULL, 0, CASE_SENSITIVE, 0, NULL,
+diff --git a/fs/ntfs/reparse.c b/fs/ntfs/reparse.c
+index 2a6480211fe3..775e96a43771 100644
+--- a/fs/ntfs/reparse.c
++++ b/fs/ntfs/reparse.c
+@@ -787,7 +787,12 @@ static int ntfs_set_ntfs_reparse_data(struct ntfs_inode *ni, char *value, size_t
+ 		return -EINVAL;
+ 	xrni = xr->idx_ni;
+ 
+-	if (!ntfs_attr_exist(ni, AT_REPARSE_POINT, AT_UNNAMED, 0)) {
++	err = ntfs_attr_exist(ni, AT_REPARSE_POINT, AT_UNNAMED, 0);
++	if (err < 0) {
++		ntfs_index_ctx_put(xr);
++		goto out;
++	}
++	if (!err) {
+ 		struct reparse_point rp = {0, };
+ 
+ 		/*
 diff --git a/fs/ntfs/super.c b/fs/ntfs/super.c
 index df09c277ee54..9bf5a626abbc 100644
 --- a/fs/ntfs/super.c

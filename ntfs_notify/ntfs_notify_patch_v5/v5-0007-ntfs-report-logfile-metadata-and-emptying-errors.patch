@@ -1,4 +1,4 @@
-From 610e771ac35326357f1433aecd383042babd2130 Mon Sep 17 00:00:00 2001
+From f4cf8fc52744fd45252d8bef1f2e0584ee160534 Mon Sep 17 00:00:00 2001
 From: Dandan Wu <wudandan@kylinos.cn>
 Date: Wed, 14 Oct 2026 07:39:10 +0800
 Subject: [PATCH v5 07/31] ntfs: report logfile metadata and emptying errors
@@ -14,12 +14,12 @@ existing read-only fallback.
 
 Signed-off-by: Dandan Wu <wudandan@kylinos.cn>
 ---
- fs/ntfs/logfile.c | 51 +++++++++++++++++++++++++++--------------------
+ fs/ntfs/logfile.c | 58 +++++++++++++++++++++++++++--------------------
  fs/ntfs/super.c   |  2 +-
- 2 files changed, 30 insertions(+), 23 deletions(-)
+ 2 files changed, 35 insertions(+), 25 deletions(-)
 
 diff --git a/fs/ntfs/logfile.c b/fs/ntfs/logfile.c
-index 2f27ae7a3927..f03f05f07d23 100644
+index 2f27ae7a3927..0b60c6b0479d 100644
 --- a/fs/ntfs/logfile.c
 +++ b/fs/ntfs/logfile.c
 @@ -17,14 +17,14 @@
@@ -139,7 +139,15 @@ index 2f27ae7a3927..f03f05f07d23 100644
  				goto err_out;
  			}
  			size = min_t(int, to_read, PAGE_SIZE);
-@@ -461,7 +459,7 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
+@@ -452,6 +450,7 @@ static int ntfs_check_and_load_restart_page(struct inode *vi,
+  */
+ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
+ {
++	int report_err = 0;
+ 	s64 size, pos;
+ 	s64 rstr1_lsn, rstr2_lsn;
+ 	struct ntfs_volume *vol = NTFS_SB(log_vi->i_sb);
+@@ -461,7 +460,7 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
  	struct restart_page_header *rstr1_ph = NULL;
  	struct restart_page_header *rstr2_ph = NULL;
  	int log_page_size, err;
@@ -148,24 +156,27 @@ index 2f27ae7a3927..f03f05f07d23 100644
  	u8 log_page_bits;
  
  	ntfs_debug("Entering.");
-@@ -495,6 +493,7 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
+@@ -495,8 +494,9 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
  	 */
  	if (size < log_page_size * 2 || (size - log_page_size * 2) >>
  			log_page_bits < MinLogRecordPages) {
-+		ntfs_report_file_metadata_error(log_vi, -EFSCORRUPTED);
++		report_err = -EFSCORRUPTED;
  		ntfs_error(vol->sb, "LogFile is too small.");
- 		return false;
+-		return false;
++		goto err_out;
  	}
-@@ -516,6 +515,8 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
+ 	/*
+ 	 * Read through the file looking for a restart page.  Since the restart
+@@ -516,6 +516,8 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
  			}
  			folio = read_mapping_folio(mapping, idx, NULL);
  			if (IS_ERR(folio)) {
 +				if (PTR_ERR(folio) == -EIO)
-+					ntfs_report_file_metadata_error(log_vi, -EIO);
++					report_err = -EIO;
  				ntfs_error(vol->sb, "Error mapping LogFile page (index %lu).",
  						idx);
  				goto err_out;
-@@ -574,7 +575,11 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
+@@ -574,7 +576,11 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
  		 * not abort if the restart page was invalid as we might still
  		 * find a valid one further in the file.
  		 */
@@ -174,20 +185,33 @@ index 2f27ae7a3927..f03f05f07d23 100644
 +			unsupported_version = true;
 +		else if (err != -EINVAL) {
 +			if (err == -EIO)
-+				ntfs_report_file_metadata_error(log_vi, err);
++				report_err = err;
  			kunmap_local(kbase);
  			folio_put(folio);
  			goto err_out;
-@@ -594,6 +599,8 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
+@@ -594,9 +600,11 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
  		return true;
  	}
  	if (!rstr1_ph) {
 +		if (!unsupported_version)
-+			ntfs_report_file_metadata_error(log_vi, -EFSCORRUPTED);
++			report_err = -EFSCORRUPTED;
  		ntfs_error(vol->sb,
  			"Did not find any restart pages in LogFile and it was not empty.");
- 		return false;
-@@ -767,10 +774,10 @@ bool ntfs_empty_logfile(struct inode *log_vi)
+-		return false;
++		goto err_out;
+ 	}
+ 	/* If both restart pages were found, use the more recent one. */
+ 	if (rstr2_ph) {
+@@ -624,6 +632,8 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
+ 	return true;
+ err_out:
+ 	kvfree(rstr1_ph);
++	if (report_err)
++		ntfs_report_file_metadata_error(log_vi, report_err);
+ 	return false;
+ }
+ 
+@@ -767,10 +777,10 @@ bool ntfs_empty_logfile(struct inode *log_vi)
  	ntfs_error(sb, "Failed to write buffer.  Unmount and run chkdsk.");
  	goto dirty_err;
  rl_err:
@@ -201,10 +225,10 @@ index 2f27ae7a3927..f03f05f07d23 100644
  	kvfree(empty_buf);
  	kfree(ra);
 diff --git a/fs/ntfs/super.c b/fs/ntfs/super.c
-index f5c9cf368f8a..7c10a1b24b14 100644
+index dff04972e9ec..481d528884ad 100644
 --- a/fs/ntfs/super.c
 +++ b/fs/ntfs/super.c
-@@ -1357,7 +1357,7 @@ static int load_and_check_logfile(struct ntfs_volume *vol,
+@@ -1365,7 +1365,7 @@ static int load_and_check_logfile(struct ntfs_volume *vol,
  	int err = 0;
  
  	ntfs_debug("Entering.");

@@ -1,4 +1,4 @@
-From 8da862867eaf57a104099ae0907b902c5f618e45 Mon Sep 17 00:00:00 2001
+From 0c4f52cfcc38856ce72b1c014b1b7c39738743e0 Mon Sep 17 00:00:00 2001
 From: Baolin Liu <liubaolin@kylinos.cn>
 Date: Wed, 14 Oct 2026 07:39:10 +0800
 Subject: [PATCH v5 14/31] ntfs: report attribute list update and recovery
@@ -130,10 +130,10 @@ index 7e7440c5f2ba..de642af3bc30 100644
  		ntfs_error(base_ni->vol->sb,
  			   "Failed to write attribute list of inode %#llx",
 diff --git a/fs/ntfs/inode.c b/fs/ntfs/inode.c
-index 6ed995b09a3f..564682f59203 100644
+index c0f91b02efa0..b851b848bc2e 100644
 --- a/fs/ntfs/inode.c
 +++ b/fs/ntfs/inode.c
-@@ -3231,7 +3231,7 @@ int ntfs_inode_attach_all_extents(struct ntfs_inode *ni)
+@@ -3222,7 +3222,7 @@ int ntfs_inode_attach_all_extents(struct ntfs_inode *ni)
   */
  int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
  {
@@ -142,7 +142,7 @@ index 6ed995b09a3f..564682f59203 100644
  	struct ntfs_attr_search_ctx *ctx;
  	u8 *al = NULL, *aln;
  	int al_len = 0;
-@@ -3252,7 +3252,7 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
+@@ -3243,7 +3243,7 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
  
  	ni_mrec = map_mft_record(ni);
  	if (IS_ERR(ni_mrec))
@@ -151,7 +151,7 @@ index 6ed995b09a3f..564682f59203 100644
  
  	/* Form attribute list. */
  	ctx = ntfs_attr_get_search_ctx(ni, ni_mrec);
-@@ -3267,7 +3267,9 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
+@@ -3258,7 +3258,9 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
  		int ale_size;
  
  		if (ctx->attr->type == AT_ATTRIBUTE_LIST) {
@@ -162,7 +162,7 @@ index 6ed995b09a3f..564682f59203 100644
  			ntfs_error(ni->vol->sb, "Attribute list already present");
  			goto put_err_out;
  		}
-@@ -3355,15 +3357,19 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
+@@ -3346,15 +3348,19 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
  	NInoClearAttrList(ni);
  	/* Remove $ATTRIBUTE_LIST record. */
  	ntfs_attr_reinit_search_ctx(ctx);
@@ -185,7 +185,7 @@ index 6ed995b09a3f..564682f59203 100644
  
  	/* Setup back in-memory runlist. */
  	ni->attr_list = al;
-@@ -3378,17 +3384,21 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
+@@ -3369,17 +3375,21 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
  	ale = (struct attr_list_entry *)al;
  	while ((u8 *)ale < al + al_len) {
  		if (MREF_LE(ale->mft_reference) != ni->mft_no) {
@@ -213,7 +213,7 @@ index 6ed995b09a3f..564682f59203 100644
  			ntfs_attr_reinit_search_ctx(ctx);
  		}
  		ale = (struct attr_list_entry *)((u8 *)ale + le16_to_cpu(ale->length));
-@@ -3401,8 +3411,13 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
+@@ -3392,8 +3402,13 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
  	NInoClearAttrListDirty(ni);
  	ntfs_attr_put_search_ctx(ctx);
  	ctx = NULL;

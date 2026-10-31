@@ -1,4 +1,4 @@
-From bcc216d30874776e009ee226bc4fda94d076ef9d Mon Sep 17 00:00:00 2001
+From 0f326d4fe910059a3720841f54681c8c0fbd2ad8 Mon Sep 17 00:00:00 2001
 From: Baolin Liu <liubaolin@kylinos.cn>
 Date: Wed, 14 Oct 2026 07:39:10 +0800
 Subject: [PATCH v5 18/31] ntfs: report inode metadata and eviction cleanup
@@ -24,7 +24,7 @@ Signed-off-by: Baolin Liu <liubaolin@kylinos.cn>
  1 file changed, 96 insertions(+), 30 deletions(-)
 
 diff --git a/fs/ntfs/inode.c b/fs/ntfs/inode.c
-index 83d45383a5d6..0e67078552cb 100644
+index 958c949009b9..5d1f724014e8 100644
 --- a/fs/ntfs/inode.c
 +++ b/fs/ntfs/inode.c
 @@ -372,8 +372,10 @@ static int ntfs_non_resident_dealloc_clusters(struct ntfs_inode *ni)
@@ -190,7 +190,7 @@ index 83d45383a5d6..0e67078552cb 100644
  	return err;
  }
  
-@@ -2428,16 +2442,20 @@ static int ntfs_delete_base_inode(struct ntfs_inode *ni)
+@@ -2419,16 +2433,20 @@ static int ntfs_delete_base_inode(struct ntfs_inode *ni)
  	 */
  	while (ni->nr_extents) {
  		err = ntfs_mft_record_free(ni->vol, *(ni->ext.extent_ntfs_inos));
@@ -213,7 +213,7 @@ index 83d45383a5d6..0e67078552cb 100644
  	return err;
  }
  
-@@ -2468,9 +2486,11 @@ void ntfs_evict_big_inode(struct inode *vi)
+@@ -2459,9 +2477,11 @@ void ntfs_evict_big_inode(struct inode *vi)
  
  	if (NInoDirty(ni)) {
  		/* Committing the inode also commits all extent inodes. */
@@ -226,7 +226,7 @@ index 83d45383a5d6..0e67078552cb 100644
  			ntfs_debug("Failed to commit dirty inode 0x%llx.  Losing data!",
  				   ni->mft_no);
  			NInoClearAttrListDirty(ni);
-@@ -2478,13 +2498,20 @@ void ntfs_evict_big_inode(struct inode *vi)
+@@ -2469,13 +2489,20 @@ void ntfs_evict_big_inode(struct inode *vi)
  		}
  	}
  
@@ -248,7 +248,7 @@ index 83d45383a5d6..0e67078552cb 100644
  		}
  		ni->nr_extents = 0;
  		kvfree(ni->ext.extent_ntfs_inos);
-@@ -2773,11 +2800,15 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni)
+@@ -2764,11 +2791,15 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni)
  	/* Collect the reparse tag, if any */
  	reparse_tag = cpu_to_le32(0);
  	if (ni->flags & FILE_ATTR_REPARSE_POINT) {
@@ -266,7 +266,7 @@ index 83d45383a5d6..0e67078552cb 100644
  		}
  		ntfs_attr_reinit_search_ctx(ctx);
  	}
-@@ -2791,6 +2822,9 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni)
+@@ -2782,6 +2813,9 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni)
  
  		index_vi = ntfs_iget(sb, MREF_LE(fn->parent_directory));
  		if (IS_ERR(index_vi)) {
@@ -276,7 +276,7 @@ index 83d45383a5d6..0e67078552cb 100644
  			ntfs_error(sb, "Failed to open inode %lld with index",
  					(long long)MREF_LE(fn->parent_directory));
  			continue;
-@@ -2816,6 +2850,11 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni)
+@@ -2807,6 +2841,11 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni)
  
  		err = ntfs_index_lookup(fn, sizeof(struct file_name_attr), ictx);
  		if (err) {
@@ -288,7 +288,7 @@ index 83d45383a5d6..0e67078552cb 100644
  			ntfs_debug("Index lookup failed, inode %llu",
  					index_ni->mft_no);
  			ntfs_index_ctx_put(ictx);
-@@ -2886,7 +2925,8 @@ int ntfs_get_block_mft_record(struct ntfs_inode *mft_ni, struct ntfs_inode *ni)
+@@ -2877,7 +2916,8 @@ int ntfs_get_block_mft_record(struct ntfs_inode *mft_ni, struct ntfs_inode *ni)
  	rl = mft_ni->runlist.rl;
  	if (!rl) {
  		ntfs_error(mft_ni->vol->sb, "$MFT runlist is not present");
@@ -298,7 +298,7 @@ index 83d45383a5d6..0e67078552cb 100644
  	}
  
  	/* Seek to element containing target vcn. */
-@@ -2968,8 +3008,11 @@ int __ntfs_write_inode(struct inode *vi, int sync)
+@@ -2959,8 +2999,11 @@ int __ntfs_write_inode(struct inode *vi, int sync)
  	}
  
  	err = ntfs_inode_sync_standard_information(vi, m);
@@ -311,7 +311,7 @@ index 83d45383a5d6..0e67078552cb 100644
  
  	/*
  	 * when being umounted and inodes are evicted, write_inode()
-@@ -2987,8 +3030,10 @@ int __ntfs_write_inode(struct inode *vi, int sync)
+@@ -2978,8 +3021,10 @@ int __ntfs_write_inode(struct inode *vi, int sync)
  		down_read(&mft_ni->runlist.lock);
  		err = ntfs_get_block_mft_record(mft_ni, ni);
  		up_read(&mft_ni->runlist.lock);
@@ -323,7 +323,7 @@ index 83d45383a5d6..0e67078552cb 100644
  
  		err = write_mft_record(ni, m, sync);
  		if (err)
-@@ -3006,6 +3051,7 @@ int __ntfs_write_inode(struct inode *vi, int sync)
+@@ -2997,6 +3042,7 @@ int __ntfs_write_inode(struct inode *vi, int sync)
  			err = ntfs_get_block_mft_record(mft_ni,
  						   ni->ext.extent_ntfs_inos[i]);
  			if (err) {
@@ -331,7 +331,7 @@ index 83d45383a5d6..0e67078552cb 100644
  				mutex_unlock(&ni->extent_lock);
  				up_read(&mft_ni->runlist.lock);
  				mutex_unlock(&ni->mrec_lock);
-@@ -3067,7 +3113,10 @@ int __ntfs_write_inode(struct inode *vi, int sync)
+@@ -3058,7 +3104,10 @@ int __ntfs_write_inode(struct inode *vi, int sync)
  		mark_inode_dirty(vi);
  	else {
  		ntfs_error(vi->i_sb, "Failed (error %i):  Run chkdsk.", -err);
@@ -343,7 +343,7 @@ index 83d45383a5d6..0e67078552cb 100644
  	}
  	if (need_iput)
  		iput(vi);
-@@ -3136,8 +3185,10 @@ static struct ntfs_inode *ntfs_extent_inode_open(struct ntfs_inode *base_ni,
+@@ -3127,8 +3176,10 @@ static struct ntfs_inode *ntfs_extent_inode_open(struct ntfs_inode *base_ni,
  			    seq_no != le16_to_cpu(ni_mrec->sequence_number)) {
  				ntfs_error(sb, "Found stale extent mft reference mft=%llu",
  						ni->mft_no);
@@ -355,7 +355,7 @@ index 83d45383a5d6..0e67078552cb 100644
  			}
  			unmap_mft_record(ni);
  			goto out;
-@@ -3200,8 +3251,9 @@ int ntfs_inode_attach_all_extents(struct ntfs_inode *ni)
+@@ -3191,8 +3242,9 @@ int ntfs_inode_attach_all_extents(struct ntfs_inode *ni)
  		return 0;
  
  	if (!ni->attr_list) {
@@ -366,7 +366,7 @@ index 83d45383a5d6..0e67078552cb 100644
  	}
  
  	/* Walk through attribute list and attach all extents. */
-@@ -3778,6 +3830,11 @@ s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
+@@ -3769,6 +3821,11 @@ s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
  				       CASE_SENSITIVE,
  				       0, NULL, 0, ctx);
  		if (err) {
@@ -378,7 +378,7 @@ index 83d45383a5d6..0e67078552cb 100644
  			ntfs_error(vi->i_sb, "Failed to look up attr %#x", ni->type);
  			ntfs_attr_put_search_ctx(ctx);
  			mutex_unlock(&mrec_ni->mrec_lock);
-@@ -3853,6 +3910,11 @@ static inline int ntfs_enlarge_attribute(struct inode *vi, s64 pos, s64 count,
+@@ -3844,6 +3901,11 @@ static inline int ntfs_enlarge_attribute(struct inode *vi, s64 pos, s64 count,
  				       CASE_SENSITIVE,
  				       0, NULL, 0, ctx);
  		if (ret) {
@@ -390,7 +390,7 @@ index 83d45383a5d6..0e67078552cb 100644
  			ntfs_error(sb, "Failed to look up attr %#x", ni->type);
  			return ret;
  		}
-@@ -4103,6 +4165,10 @@ s64 ntfs_inode_attr_pwrite(struct inode *vi, s64 pos, s64 count, u8 *buf, bool s
+@@ -4094,6 +4156,10 @@ s64 ntfs_inode_attr_pwrite(struct inode *vi, s64 pos, s64 count, u8 *buf, bool s
  			       CASE_SENSITIVE,
  			       0, NULL, 0, ctx);
  	if (ret) {

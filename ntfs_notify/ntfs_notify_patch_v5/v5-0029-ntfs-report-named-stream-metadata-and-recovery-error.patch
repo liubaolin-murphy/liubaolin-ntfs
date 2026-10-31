@@ -1,4 +1,4 @@
-From 0edd30ae37f42751b9e608a9dfc2878321a7eb2d Mon Sep 17 00:00:00 2001
+From 0d9aa71522c7b4f3923c1d742b9680711a66c1b0 Mon Sep 17 00:00:00 2001
 From: Xuewen Wang <wangxuewen@kylinos.cn>
 Date: Wed, 14 Oct 2026 07:39:10 +0800
 Subject: [PATCH v5 29/31] ntfs: report named stream metadata and recovery
@@ -17,12 +17,12 @@ interruption exceptions, and keep ordinary missing streams silent.
 
 Signed-off-by: Xuewen Wang <wangxuewen@kylinos.cn>
 ---
- fs/ntfs/named_stream.c | 35 +++++++++++++++++++++++++++--------
+ fs/ntfs/named_stream.c | 41 ++++++++++++++++++++++++++++++++---------
  fs/ntfs/stream.h       |  2 +-
- 2 files changed, 28 insertions(+), 9 deletions(-)
+ 2 files changed, 33 insertions(+), 10 deletions(-)
 
 diff --git a/fs/ntfs/named_stream.c b/fs/ntfs/named_stream.c
-index bf5fae52331e..2e2383e381a6 100644
+index bf5fae52331e..788a581d854b 100644
 --- a/fs/ntfs/named_stream.c
 +++ b/fs/ntfs/named_stream.c
 @@ -252,6 +252,7 @@ int ntfs_stream_path_check(struct ntfs_volume *vol,
@@ -33,39 +33,46 @@ index bf5fae52331e..2e2383e381a6 100644
   *
   * Resolve the directory entry and verify its MFT reference before returning
   * the inode.
-@@ -259,7 +260,7 @@ int ntfs_stream_path_check(struct ntfs_volume *vol,
+@@ -259,8 +260,9 @@ int ntfs_stream_path_check(struct ntfs_volume *vol,
   * Return: Referenced inode on success, or ERR_PTR() on failure.
   */
  struct inode *ntfs_stream_lookup_inode_by_name(struct inode *dir_ino,
 -		__le16 *uname, int uname_len)
 +		__le16 *uname, int uname_len, bool dir_locked)
  {
++	int report_err = 0;
  	struct ntfs_volume *vol = NTFS_SB(dir_ino->i_sb);
  	struct ntfs_name *name = NULL;
-@@ -276,12 +277,20 @@ struct inode *ntfs_stream_lookup_inode_by_name(struct inode *dir_ino,
+ 	struct inode *inode;
+@@ -276,13 +278,24 @@ struct inode *ntfs_stream_lookup_inode_by_name(struct inode *dir_ino,
  		return ERR_PTR(MREF_ERR(mref));
  
  	inode = ntfs_iget(vol->sb, MREF(mref));
 -	if (IS_ERR(inode))
+-		return inode;
 +	if (IS_ERR(inode)) {
 +		if (dir_locked && PTR_ERR(inode) == -ENOENT) {
-+			ntfs_report_file_metadata_error(dir_ino, -EFSCORRUPTED);
++			report_err = -EFSCORRUPTED;
 +			inode = ERR_PTR(-EFSCORRUPTED);
 +		}
- 		return inode;
++		goto out;
 +	}
  	if (MSEQNO(mref) != NTFS_I(inode)->seq_no &&
  	    MREF(mref) != FILE_MFT) {
 +		/* Unlocked dentry revalidation can race with unlink and reuse. */
 +		if (dir_locked)
-+			ntfs_report_file_metadata_error(dir_ino, -EFSCORRUPTED);
++			report_err = -EFSCORRUPTED;
  		iput(inode);
 -		return ERR_PTR(-EIO);
-+		return ERR_PTR(dir_locked ? -EFSCORRUPTED : -EIO);
++		inode = ERR_PTR(dir_locked ? -EFSCORRUPTED : -EIO);
  	}
++out:
++	if (report_err)
++		ntfs_report_file_metadata_error(dir_ino, report_err);
  	return inode;
  }
-@@ -333,7 +342,7 @@ static int ntfs_stream_d_revalidate(struct inode *dir,
+ 
+@@ -333,7 +346,7 @@ static int ntfs_stream_d_revalidate(struct inode *dir,
  			ni->vol->upcase_len))
  		goto out;
  
@@ -74,7 +81,7 @@ index bf5fae52331e..2e2383e381a6 100644
  	if (IS_ERR(base_vi))
  		goto out;
  	if (NTFS_I(base_vi) != ni->ext.base_ntfs_ino) {
-@@ -441,7 +450,7 @@ struct dentry *ntfs_lookup_stream(struct inode *dir_ino,
+@@ -441,7 +454,7 @@ struct dentry *ntfs_lookup_stream(struct inode *dir_ino,
  	}
  
  	base_vi = ntfs_stream_lookup_inode_by_name(dir_ino, base_uname,
@@ -83,7 +90,7 @@ index bf5fae52331e..2e2383e381a6 100644
  	kmem_cache_free(ntfs_name_cache, base_uname);
  	if (IS_ERR(base_vi)) {
  		err = PTR_ERR(base_vi);
-@@ -564,7 +573,7 @@ struct inode *ntfs_create_named_stream(const struct mnt_idmap *idmap,
+@@ -564,7 +577,7 @@ struct inode *ntfs_create_named_stream(const struct mnt_idmap *idmap,
  	bool stream_created = false;
  	int err, rollback_err;
  
@@ -92,7 +99,7 @@ index bf5fae52331e..2e2383e381a6 100644
  	if (IS_ERR(base_vi))
  		return base_vi;
  	if (!S_ISREG(base_vi->i_mode) && !S_ISDIR(base_vi->i_mode)) {
-@@ -635,6 +644,10 @@ struct inode *ntfs_create_named_stream(const struct mnt_idmap *idmap,
+@@ -635,6 +648,10 @@ struct inode *ntfs_create_named_stream(const struct mnt_idmap *idmap,
  	else
  		err = PTR_ERR(stream_vi);
  	if (err) {
@@ -103,7 +110,7 @@ index bf5fae52331e..2e2383e381a6 100644
  		if (stream_created) {
  			rollback_err = ntfs_attr_remove(base_ni, AT_DATA,
  					stream_name, stream_len, &rollback_vi);
-@@ -646,7 +659,8 @@ struct inode *ntfs_create_named_stream(const struct mnt_idmap *idmap,
+@@ -646,7 +663,8 @@ struct inode *ntfs_create_named_stream(const struct mnt_idmap *idmap,
  				    rollback_err == -ERESTARTSYS) {
  					err = rollback_err;
  				} else {
@@ -113,7 +120,7 @@ index bf5fae52331e..2e2383e381a6 100644
  					NVolSetShutdown(base_ni->vol);
  					err = -EIO;
  				}
-@@ -698,7 +712,7 @@ int ntfs_unlink_named_stream(struct inode *dir, struct dentry *dentry)
+@@ -698,7 +716,7 @@ int ntfs_unlink_named_stream(struct inode *dir, struct dentry *dentry)
  	if (!path_result)
  		return -EINVAL;
  
@@ -122,7 +129,7 @@ index bf5fae52331e..2e2383e381a6 100644
  	if (IS_ERR(base_vi)) {
  		err = PTR_ERR(base_vi);
  		goto out_free;
-@@ -1044,6 +1058,7 @@ static int ntfs_stream_finish_remove(struct inode *attr_vi)
+@@ -1044,6 +1062,7 @@ static int ntfs_stream_finish_remove(struct inode *attr_vi)
  		remove_inode_hash(attr_vi);
  	} else {
  		NInoSetBeingDeleted(attr_ni);
@@ -130,7 +137,7 @@ index bf5fae52331e..2e2383e381a6 100644
  		remove_inode_hash(attr_vi);
  	}
  
-@@ -1279,6 +1294,10 @@ static int ntfs_stream_ioctl_get_inode(struct inode *base_vi, __le16 *sname,
+@@ -1279,6 +1298,10 @@ static int ntfs_stream_ioctl_get_inode(struct inode *base_vi, __le16 *sname,
  	attr_vi = ntfs_attr_iget(base_vi, AT_DATA, sname, sname_len);
  	if (IS_ERR(attr_vi)) {
  		err = PTR_ERR(attr_vi);

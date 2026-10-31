@@ -1,4 +1,4 @@
-From 3ad6e5b4d9e146fa950c914778ae4fcea5e92b92 Mon Sep 17 00:00:00 2001
+From f31c3f8eb033fa4756e9d9024f438fd5039f081e Mon Sep 17 00:00:00 2001
 From: Xuewen Wang <wangxuewen@kylinos.cn>
 Date: Wed, 14 Oct 2026 07:39:10 +0800
 Subject: [PATCH v5 11/31] ntfs: handle source record removal failure during
@@ -24,10 +24,10 @@ Signed-off-by: Xuewen Wang <wangxuewen@kylinos.cn>
  1 file changed, 11 insertions(+), 1 deletion(-)
 
 diff --git a/fs/ntfs/attrib.c b/fs/ntfs/attrib.c
-index c59643fb766a..07fb1c77c7af 100644
+index 5af8ac41af17..f1c99e0d8dca 100644
 --- a/fs/ntfs/attrib.c
 +++ b/fs/ntfs/attrib.c
-@@ -3576,7 +3576,17 @@ int ntfs_attr_record_move_to(struct ntfs_attr_search_ctx *ctx, struct ntfs_inode
+@@ -3578,7 +3578,17 @@ int ntfs_attr_record_move_to(struct ntfs_attr_search_ctx *ctx, struct ntfs_inode
  	nctx->attr->instance = nctx->mrec->next_attr_instance;
  	nctx->mrec->next_attr_instance =
  		cpu_to_le16((le16_to_cpu(nctx->mrec->next_attr_instance) + 1) & 0xffff);
